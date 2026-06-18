@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "register": "node scripts/register-commands.mjs"
+    "register": "node scripts/register-commands.mjs",
+    "clear-global-commands": "node scripts/clear-global-commands.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.108.2",
