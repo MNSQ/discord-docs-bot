@@ -1,6 +1,35 @@
 import Link from 'next/link';
+import DocsForm, { type Doc } from './DocsForm';
+import { getDb } from '@/lib/supabase';
 
-export default function DashboardPage() {
+async function fetchDocs(discordGuildId: string): Promise<Doc[]> {
+  try {
+    const db = getDb();
+
+    const { data: guild } = await db
+      .from('guilds')
+      .select('id')
+      .eq('discord_guild_id', discordGuildId)
+      .maybeSingle();
+
+    if (!guild) return [];
+
+    const { data } = await db
+      .from('documents')
+      .select('id, title, source_type, created_at')
+      .eq('guild_id', guild.id)
+      .order('created_at', { ascending: false });
+
+    return (data ?? []) as Doc[];
+  } catch {
+    return [];
+  }
+}
+
+export default async function DashboardPage() {
+  const guildId = process.env.DISCORD_GUILD_ID ?? '';
+  const docs = guildId ? await fetchDocs(guildId) : [];
+
   return (
     <div className="flex flex-col min-h-screen bg-white dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 font-sans">
       <header className="flex items-center justify-between px-8 py-5 border-b border-zinc-200 dark:border-zinc-800">
@@ -10,36 +39,14 @@ export default function DashboardPage() {
         <span className="text-sm text-zinc-400">Dashboard</span>
       </header>
 
-      <main className="flex flex-col flex-1 items-center justify-center px-6 text-center gap-6 py-24">
-        <div className="flex flex-col gap-3 max-w-md">
-          <h1 className="text-3xl font-bold tracking-tight">Documentation Manager</h1>
-          <p className="text-zinc-500 dark:text-zinc-400">
-            This is where you&apos;ll manage the documentation DocBot uses to answer
-            questions in your Discord server.
+      <main className="flex flex-col flex-1 items-center px-6 py-12 gap-8">
+        {!guildId && (
+          <p className="text-sm text-red-500">
+            DISCORD_GUILD_ID is not set. Add it to .env.local to use the dashboard.
           </p>
-        </div>
-
-        <div className="grid sm:grid-cols-2 gap-4 max-w-xl w-full text-left mt-4">
-          <PlaceholderCard title="Upload Documentation" description="Paste or upload text to build your knowledge base." />
-          <PlaceholderCard title="Manage Documents" description="View, edit, or delete uploaded documentation." />
-          <PlaceholderCard title="View Usage" description="See how many questions were asked and answered." />
-          <PlaceholderCard title="Server Settings" description="Configure bot behavior per Discord server." />
-        </div>
-
-        <p className="text-xs text-zinc-400 dark:text-zinc-600 max-w-xs">
-          Authentication and full functionality will be added in the next milestone.
-        </p>
+        )}
+        <DocsForm docs={docs} />
       </main>
-    </div>
-  );
-}
-
-function PlaceholderCard({ title, description }: { title: string; description: string }) {
-  return (
-    <div className="flex flex-col gap-2 p-5 rounded-xl border border-zinc-200 dark:border-zinc-800 opacity-60">
-      <h3 className="font-semibold">{title}</h3>
-      <p className="text-sm text-zinc-500 dark:text-zinc-400">{description}</p>
-      <span className="text-xs text-indigo-400 mt-1">Coming soon</span>
     </div>
   );
 }
