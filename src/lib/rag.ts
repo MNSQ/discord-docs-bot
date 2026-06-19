@@ -182,11 +182,75 @@ function rankAndSelect(candidates: Chunk[], question: string): RankResult {
   return { chunks: selected, bestScore: best.score, bestIndex: best.chunk.chunk_index };
 }
 
+// ─── Policy / refusal chunk detection ────────────────────────────────────────
+//
+// A policy chunk describes what the bot should NOT do, not a content answer.
+// Example: "The bot should avoid pretending to know things outside the docs,
+// including weather, jokes, politics, or personal advice."
+//
+// If the top-ranked chunk is a policy chunk and the question is not asking
+// about the policy itself, we must not return it as an answer.
+
+// Phrases that mark a chunk as a refusal / instruction chunk.
+const REFUSAL_SIGNALS = [
+  'should not answer',
+  'should avoid',
+  'should not respond',
+  'avoid answering',
+  'avoid pretending',
+  'pretend to know',
+  'cannot answer',
+  'will not answer',
+  'does not answer',
+  'unable to answer',
+  'not designed to answer',
+  'not its purpose',
+  'unrelated questions',
+  'unrelated topics',
+  'off-topic',
+  'outside the scope',
+  'out of scope',
+  'outside its knowledge',
+  'should refuse',
+  'should not pretend',
+];
+
+// Phrases in the user's question that indicate they ARE asking about the
+// bot's policy / limitations — in which case the policy chunk IS the answer.
+const POLICY_QUESTION_SIGNALS = [
+  'refuse', 'refusal',
+  'avoid', 'avoids',
+  'limitation', 'limitations', 'limit',
+  'scope', 'out of scope', 'off-topic',
+  'policy', 'policies',
+  'restriction', 'restrictions',
+  'inappropriate',
+  'unable', 'cannot', "can't",
+  'not answer', 'not designed',
+  'capable', 'designed to',
+  'what won', 'what can the bot', 'what does the bot',
+];
+
+function isPolicyChunk(content: string): boolean {
+  const lower = content.toLowerCase();
+  return REFUSAL_SIGNALS.some(signal => lower.includes(signal));
+}
+
+function isAskingAboutPolicy(question: string): boolean {
+  const lower = question.toLowerCase();
+  return POLICY_QUESTION_SIGNALS.some(signal => lower.includes(signal));
+}
+
 // ─── Retrieval ────────────────────────────────────────────────────────────────
 //
+// Minimum score a chunk must reach before we consider it a real match.
+// Roughly: one keyword hit whose IDF ≥ 1.0, meaning the term appears in
+// ≤37% of the candidate set. Tune this up to tighten, down to loosen.
+export const MIN_SCORE = 1.0;
+
 // Return semantics — callers must handle all three:
 //   null  → no guild row or no chunks (server has no docs yet)
-//   []    → chunks exist but bestScore is 0 (question has no keyword overlap)
+//   []    → chunks exist but no usable match (weak score or policy chunk)
 //   [...] → best-matching chunk(s)
 
 export async function retrieveRelevantChunks(
@@ -242,9 +306,23 @@ export async function retrieveRelevantChunks(
 
   const { chunks, bestScore } = rankAndSelect(candidates, question);
 
-  if (bestScore === 0) {
-    console.log('[RAG] no keyword overlap — no match');
+  if (bestScore < MIN_SCORE) {
+    console.log(`[RAG] score ${bestScore.toFixed(2)} below threshold ${MIN_SCORE} — no match`);
     return [];
+  }
+
+  // Secondary check: reject the result when the best chunk is a policy /
+  // refusal / instruction chunk and the question is not asking about that
+  // policy. This prevents the retriever from returning "the bot should not
+  // answer weather questions" as the answer to "what is the weather today?"
+  const topChunk = chunks[0];
+  if (topChunk && isPolicyChunk(topChunk.content)) {
+    if (isAskingAboutPolicy(question)) {
+      console.log('[RAG] top chunk is policy — question IS about policy → returning it');
+    } else {
+      console.log('[RAG] top chunk is policy/refusal — question is off-topic, not a content answer → rejecting');
+      return [];
+    }
   }
 
   return chunks;

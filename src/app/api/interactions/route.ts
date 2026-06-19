@@ -1,6 +1,7 @@
 import { NextRequest } from 'next/server';
 import nacl from 'tweetnacl';
 import { retrieveRelevantChunks } from '@/lib/rag';
+import { logUsage } from '@/lib/usage';
 
 const DISCORD_MAX_LENGTH = 1900;
 
@@ -51,7 +52,11 @@ export async function POST(request: NextRequest) {
 
       const discordGuildId: string = interaction.guild_id ?? '';
 
-      console.log('[/ask] guild_id:', discordGuildId);
+      // Discord puts the user in member.user for guild interactions, user for DMs.
+      const userId: string =
+        interaction.member?.user?.id ?? interaction.user?.id ?? 'unknown';
+
+      console.log('[/ask] guild_id:', discordGuildId, '| user:', userId);
       console.log('[/ask] question:', question);
 
       if (!question) {
@@ -60,19 +65,20 @@ export async function POST(request: NextRequest) {
 
       const chunks = await retrieveRelevantChunks(question, discordGuildId);
 
-      console.log('[/ask] result:', chunks === null ? 'null (no docs)' : `${chunks.length} chunk(s)`);
+      const answered = chunks !== null && chunks.length > 0;
+      console.log('[/ask] answered:', answered, '| chunks:', chunks?.length ?? 'null');
 
-      // null → guild has no docs at all
+      // Log this interaction without blocking the response.
+      logUsage({ discordGuildId, userId, question, answered });
+
       if (chunks === null) {
         return reply('I do not have any documentation for this server yet.');
       }
 
-      // [] → docs exist but no keyword match
       if (chunks.length === 0) {
-        return reply('I do not have enough information in the uploaded documentation to answer that.');
+        return reply('I could not find this in the available documentation.');
       }
 
-      // Join best chunk(s); truncate to Discord's limit.
       const text = chunks.map(c => c.content).join('\n\n');
       const truncated = text.length > DISCORD_MAX_LENGTH
         ? text.slice(0, DISCORD_MAX_LENGTH) + '…'
