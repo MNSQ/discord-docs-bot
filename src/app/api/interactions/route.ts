@@ -124,7 +124,18 @@ async function handleAskInteraction(interaction: Record<string, unknown>): Promi
     let content: string;
 
     if (chunks === null) {
-      content = 'I do not have any documentation for this server yet.';
+      const appUrl = (process.env.NEXT_PUBLIC_APP_URL ?? '').replace(/\/$/, '');
+      const dashboardUrl = appUrl
+        ? `${appUrl}/dashboard?guild_id=${encodeURIComponent(discordGuildId)}`
+        : null;
+      const lines = [
+        'No documentation has been uploaded for this Discord server yet.',
+        '',
+        'Open the dashboard, paste this Discord Server ID, and upload your docs:',
+        discordGuildId,
+      ];
+      if (dashboardUrl) lines.push('', `Dashboard: ${dashboardUrl}`);
+      content = lines.join('\n');
     } else if (chunks.length === 0) {
       content = REFUSAL;
     } else {

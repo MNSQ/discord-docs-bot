@@ -1,16 +1,26 @@
 'use client';
 
 import { useRef, useState } from 'react';
-import { useRouter } from 'next/navigation';
 
-export default function FileImportForm() {
-  const router = useRouter();
+interface Props {
+  guildId: string;
+  onSuccess: () => void;
+}
+
+export default function FileImportForm({ guildId, onSuccess }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [status, setStatus] = useState<'idle' | 'uploading' | 'ok' | 'error'>('idle');
   const [message, setMessage] = useState('');
 
   function openPicker() {
     if (status === 'uploading') return;
+    if (!guildId) {
+      setStatus('error');
+      setMessage('Enter a Discord Server ID first.');
+      return;
+    }
+    setStatus('idle');
+    setMessage('');
     inputRef.current?.click();
   }
 
@@ -23,6 +33,7 @@ export default function FileImportForm() {
 
     const formData = new FormData();
     formData.append('file', file);
+    formData.append('guild_id', guildId);
 
     const res = await fetch('/api/docs/import-file', {
       method: 'POST',
@@ -31,13 +42,12 @@ export default function FileImportForm() {
 
     const data = await res.json();
 
-    // Reset the input so the same file can be re-uploaded if needed
     if (inputRef.current) inputRef.current.value = '';
 
     if (res.ok) {
       setStatus('ok');
       setMessage(`"${data.title}" imported — ${data.chunks} chunk(s) stored.`);
-      router.refresh();
+      onSuccess();
     } else {
       setStatus('error');
       setMessage(data.error ?? 'Upload failed.');
@@ -46,7 +56,6 @@ export default function FileImportForm() {
 
   return (
     <div className="flex flex-col gap-3">
-      {/* Hidden file input — triggered explicitly via inputRef.click() */}
       <input
         ref={inputRef}
         type="file"
@@ -55,7 +64,6 @@ export default function FileImportForm() {
         style={{ display: 'none' }}
       />
 
-      {/* Clickable drop-zone area */}
       <div
         onClick={openPicker}
         role="button"

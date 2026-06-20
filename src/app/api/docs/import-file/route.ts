@@ -63,9 +63,9 @@ export async function POST(request: NextRequest) {
 
   // ── Guild ─────────────────────────────────────────────────────────────────
 
-  const discordGuildId = process.env.DISCORD_GUILD_ID;
+  const discordGuildId = (formData.get('guild_id') as string | null)?.trim() ?? '';
   if (!discordGuildId) {
-    return Response.json({ error: 'DISCORD_GUILD_ID is not set' }, { status: 500 });
+    return Response.json({ error: 'Discord Server ID is required' }, { status: 400 });
   }
 
   let db;
@@ -77,10 +77,7 @@ export async function POST(request: NextRequest) {
 
   const { data: guild, error: guildErr } = await db
     .from('guilds')
-    .upsert(
-      { discord_guild_id: discordGuildId, name: 'Test Guild' },
-      { onConflict: 'discord_guild_id' },
-    )
+    .upsert({ discord_guild_id: discordGuildId }, { onConflict: 'discord_guild_id' })
     .select('id')
     .single();
 

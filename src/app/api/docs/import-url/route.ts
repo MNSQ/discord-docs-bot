@@ -108,11 +108,15 @@ function shouldSkip(pathname: string): boolean {
 
 export async function POST(request: NextRequest) {
   const body = await request.json().catch(() => null);
-  const rawUrl: string = body?.url?.trim() ?? '';
-  const mode: string = body?.mode ?? 'single_page';
+  const rawUrl: string         = body?.url?.trim()      ?? '';
+  const mode: string           = body?.mode             ?? 'single_page';
+  const discordGuildId: string = body?.guild_id?.trim() ?? '';
 
   if (!rawUrl) {
     return Response.json({ error: 'url is required' }, { status: 400 });
+  }
+  if (!discordGuildId) {
+    return Response.json({ error: 'Discord Server ID is required' }, { status: 400 });
   }
 
   let parsedInput: URL;
@@ -120,11 +124,6 @@ export async function POST(request: NextRequest) {
     parsedInput = new URL(rawUrl);
   } catch {
     return Response.json({ error: 'Invalid URL' }, { status: 400 });
-  }
-
-  const discordGuildId = process.env.DISCORD_GUILD_ID;
-  if (!discordGuildId) {
-    return Response.json({ error: 'DISCORD_GUILD_ID is not set' }, { status: 500 });
   }
 
   let db;
@@ -136,10 +135,7 @@ export async function POST(request: NextRequest) {
 
   const { data: guild, error: guildErr } = await db
     .from('guilds')
-    .upsert(
-      { discord_guild_id: discordGuildId, name: 'Test Guild' },
-      { onConflict: 'discord_guild_id' },
-    )
+    .upsert({ discord_guild_id: discordGuildId }, { onConflict: 'discord_guild_id' })
     .select('id')
     .single();
 

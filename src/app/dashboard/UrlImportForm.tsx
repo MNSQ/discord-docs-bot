@@ -1,10 +1,13 @@
 'use client';
 
 import { useState } from 'react';
-import { useRouter } from 'next/navigation';
 
-export default function UrlImportForm() {
-  const router = useRouter();
+interface Props {
+  guildId: string;
+  onSuccess: () => void;
+}
+
+export default function UrlImportForm({ guildId, onSuccess }: Props) {
   const [url, setUrl] = useState('');
   const [fullSite, setFullSite] = useState(false);
   const [status, setStatus] = useState<'idle' | 'importing' | 'ok' | 'error'>('idle');
@@ -12,13 +15,18 @@ export default function UrlImportForm() {
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
+    if (!guildId) {
+      setStatus('error');
+      setMessage('Enter a Discord Server ID first.');
+      return;
+    }
     setStatus('importing');
     setMessage('');
 
     const res = await fetch('/api/docs/import-url', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url, mode: fullSite ? 'site_index' : 'single_page' }),
+      body: JSON.stringify({ guild_id: guildId, url, mode: fullSite ? 'site_index' : 'single_page' }),
     });
 
     const data = await res.json();
@@ -32,7 +40,7 @@ export default function UrlImportForm() {
           : `Imported — ${data.chunks} chunk(s) stored.`,
       );
       setUrl('');
-      router.refresh();
+      onSuccess();
     } else {
       setStatus('error');
       setMessage(data.error ?? 'Import failed.');

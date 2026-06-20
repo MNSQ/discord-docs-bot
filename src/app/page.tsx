@@ -23,12 +23,12 @@ export default function Home() {
         </div>
 
         <div className="flex gap-3 flex-wrap justify-center">
-          <Link
-            href="/install"
+          <a
+            href="/api/discord/install"
             className="px-5 py-2.5 rounded-lg bg-indigo-600 text-white font-medium hover:bg-indigo-700 transition-colors"
           >
-            Add to Discord
-          </Link>
+            Add bot to Discord
+          </a>
           <Link
             href="/dashboard"
             className="px-5 py-2.5 rounded-lg border border-zinc-300 dark:border-zinc-700 font-medium hover:bg-zinc-50 dark:hover:bg-zinc-900 transition-colors"
