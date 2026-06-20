@@ -18,8 +18,12 @@ create table if not exists documents (
   guild_id    uuid not null references guilds(id) on delete cascade,
   title       text not null,
   source_type text not null default 'paste',
+  source_url  text,                            -- set for source_type = 'url'
   created_at  timestamptz default now()
 );
+
+-- Migration: add source_url if upgrading from an earlier schema version.
+alter table documents add column if not exists source_url text;
 
 -- document_chunks ────────────────────────────────────────────
 create table if not exists document_chunks (
@@ -64,6 +68,11 @@ create table if not exists usage_logs (
 );
 
 create index if not exists usage_logs_guild_idx on usage_logs(guild_id);
+
+-- Migrations: add columns that may be missing in databases created from earlier
+-- schema versions. These are idempotent and safe to run multiple times.
+alter table usage_logs add column if not exists answered      boolean default false;
+alter table usage_logs add column if not exists best_chunk_id uuid    default null;
 
 -- ============================================================
 -- search_chunks(discord_guild_id, query, limit)

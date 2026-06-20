@@ -8,10 +8,12 @@
     "start": "next start",
     "lint": "eslint",
     "register": "node scripts/register-commands.mjs",
-    "clear-global-commands": "node scripts/clear-global-commands.mjs"
+    "clear-global-commands": "node scripts/clear-global-commands.mjs",
+    "gateway": "node scripts/ollama-gateway.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.108.2",
+    "mammoth": "^1.12.0",
     "next": "16.2.9",
     "react": "19.2.4",
     "react-dom": "19.2.4",

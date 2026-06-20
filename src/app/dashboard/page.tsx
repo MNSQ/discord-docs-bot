@@ -16,7 +16,7 @@ async function fetchDocs(discordGuildId: string): Promise<Doc[]> {
 
     const { data } = await db
       .from('documents')
-      .select('id, title, source_type, created_at')
+      .select('id, title, source_type, source_url, created_at')
       .eq('guild_id', guild.id)
       .order('created_at', { ascending: false });
 
