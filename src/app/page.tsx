@@ -75,9 +75,6 @@ export default function Home() {
 
       </main>
 
-      <footer className="border-t border-zinc-100 dark:border-zinc-800 py-6 text-center text-xs text-zinc-400 dark:text-zinc-600">
-        DocBot &mdash; powered by Next.js &amp; Vercel
-      </footer>
 
     </div>
   );
