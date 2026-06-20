@@ -215,20 +215,115 @@ function scoreChunk(
   return score;
 }
 
+// ─── Query expansion ─────────────────────────────────────────────────────────
+//
+// Maps known project name aliases to expanded keyword sets so IDF scoring
+// finds relevant chunks even when the doc uses a different name variant.
+
+const PROJECT_ALIAS_PATTERNS: [RegExp, string][] = [
+  [/ionet/i,                   'ionet io network decentralized gpu infrastructure'],
+  [/io\.net/i,                 'ionet io network decentralized gpu infrastructure'],
+  [/io\s+network/i,            'io network ionet decentralized gpu'],
+  [/decentralized\s+compute/i, 'decentralized compute gpu cloud inference'],
+  [/gpu\s+network/i,           'gpu network decentralized compute cloud'],
+  [/cloud\s+gpu/i,             'cloud gpu compute infrastructure'],
+  [/ai\s+infrastructure/i,     'ai infrastructure compute gpu network'],
+];
+
+function expandQuery(question: string): string {
+  const extras: string[] = [];
+  for (const [pattern, expansion] of PROJECT_ALIAS_PATTERNS) {
+    if (pattern.test(question)) extras.push(expansion);
+  }
+  return extras.length > 0 ? `${question} ${extras.join(' ')}` : question;
+}
+
+// Detects broad overview questions ("tell me about X", questions that name the
+// project itself) so retrieval can widen its net and diversify results.
+function isBroadQuestion(question: string): boolean {
+  const q = question.toLowerCase().trim();
+  if (/^tell\s+me\s+about\b/.test(q)) return true;
+  if (/^(?:give\s+me\s+an?\s+)?overview\s+of\b/.test(q)) return true;
+  if (/^(?:summarize|summary\s+of)\b/.test(q)) return true;
+  return PROJECT_ALIAS_PATTERNS.some(([p]) => p.test(q));
+}
+
+// Returns true when a document looks like an overview or intro page.
+function isOverviewDoc(
+  title: string | null | undefined,
+  sourceUrl: string | null | undefined,
+): boolean {
+  const SIGNALS = ['about', 'introduction', 'intro', 'overview', 'getting-started', 'get-started', 'what-is', 'home'];
+  const text = `${title ?? ''} ${sourceUrl ?? ''}`.toLowerCase();
+  return SIGNALS.some(s => text.includes(s));
+}
+
+// Picks the final context chunk set with per-document diversity and sibling
+// continuity so the LLM receives a richer, less repetitive context window.
+//   broad=true  → up to 6 chunks, max 2 per document
+//   broad=false → up to 4 chunks, max 3 per document
+function selectContextChunks(
+  scored: Array<{ chunk: Chunk; score: number }>,
+  broadQuestion: boolean,
+  allCandidates: Chunk[],
+): Chunk[] {
+  const maxChunks = broadQuestion ? 6 : 4;
+  const maxPerDoc = broadQuestion ? 2 : 3;
+  const selected: Chunk[] = [];
+  const seenIds   = new Set<string>();
+
+  for (const { chunk } of scored) {
+    if (selected.length >= maxChunks) break;
+    if (seenIds.has(chunk.id)) continue;
+
+    if (chunk.document_id) {
+      const fromThisDoc = selected.filter(c => c.document_id === chunk.document_id).length;
+      if (fromThisDoc >= maxPerDoc) continue;
+    }
+
+    selected.push(chunk);
+    seenIds.add(chunk.id);
+
+    // Include the next sibling when the current chunk ends abruptly, so
+    // chunk-boundary fragments don't reach the LLM in an incomplete state.
+    if (selected.length < maxChunks) {
+      const lastChar = chunk.content.trimEnd().slice(-1);
+      if (lastChar === ':' || lastChar === ',') {
+        const nextIdx = (chunk.chunk_index ?? -1) + 1;
+        const sibling = allCandidates.find(
+          c => c.document_id === chunk.document_id &&
+               c.chunk_index === nextIdx &&
+               !seenIds.has(c.id),
+        );
+        if (sibling) {
+          selected.push(sibling);
+          seenIds.add(sibling.id);
+        }
+      }
+    }
+  }
+
+  return selected;
+}
+
 // ─── Rank + select ────────────────────────────────────────────────────────────
 
 interface RankResult {
   chunks: Chunk[];
   bestScore: number;
-  bestIndex: number | undefined;
 }
 
-function rankAndSelect(candidates: Chunk[], question: string): RankResult {
+function rankAndSelect(
+  candidates: Chunk[],
+  question: string,
+  broadQuestion: boolean,
+): RankResult {
   if (candidates.length === 0) {
-    return { chunks: [], bestScore: 0, bestIndex: undefined };
+    return { chunks: [], bestScore: 0 };
   }
 
-  const keywords = extractKeywords(question);
+  const expandedQ   = expandQuery(question);
+  const keywords    = extractKeywords(expandedQ);
   const cleanPhrase = question
     .toLowerCase()
     .replace(/[^\w\s]/g, ' ')
@@ -244,7 +339,8 @@ function rankAndSelect(candidates: Chunk[], question: string): RankResult {
 
   const scored = candidates.map(c => ({
     chunk: c,
-    score: scoreChunk(keywords, idf, cleanPhrase, c.content, c.title, c.source_url),
+    score: scoreChunk(keywords, idf, cleanPhrase, c.content, c.title, c.source_url)
+           + (broadQuestion && isOverviewDoc(c.title, c.source_url) ? 4 : 0),
   }));
   scored.sort((a, b) => b.score - a.score);
 
@@ -262,19 +358,16 @@ function rankAndSelect(candidates: Chunk[], question: string): RankResult {
     );
   });
 
-  const best = scored[0];
-  const selected: Chunk[] = [best.chunk];
+  const selected  = selectContextChunks(scored, broadQuestion, candidates);
+  const bestScore = scored[0]?.score ?? 0;
 
-  const lastChar = best.chunk.content.trimEnd().slice(-1);
-  if (lastChar === ':' || lastChar === ',') {
-    const nextIdx = (best.chunk.chunk_index ?? -1) + 1;
-    const next = candidates.find(c => c.chunk_index === nextIdx);
-    if (next) selected.push(next);
-  }
+  console.log(
+    '[RAG] selected', selected.length, 'chunk(s)',
+    '| best score:', bestScore.toFixed(2),
+    '| docs:', [...new Set(selected.map(c => c.title ?? 'n/a'))].join(', '),
+  );
 
-  console.log('[RAG] selected idx:', best.chunk.chunk_index, '| score:', best.score.toFixed(2));
-
-  return { chunks: selected, bestScore: best.score, bestIndex: best.chunk.chunk_index };
+  return { chunks: selected, bestScore };
 }
 
 // ─── Policy / refusal chunk detection ────────────────────────────────────────
@@ -513,12 +606,15 @@ export async function retrieveRelevantChunks(
   // ── 6. Off-topic guard: bail if no domain keywords survive stopword filter ──
   // Words like "weather", "paris", "today", "now" are stopwords, so a question
   // with only generic terms extracts 0 keywords → no meaningful match possible.
-  const questionKeywords = extractKeywords(question);
+  const questionKeywords = extractKeywords(expandQuery(question));
   if (questionKeywords.length === 0) {
     console.log('[RAG] rejected — no meaningful domain keywords (off-topic question)');
     return [];
   }
   console.log('[RAG] meaningful keywords:', questionKeywords.join(', '));
+
+  const broadQuestion = isBroadQuestion(question);
+  if (broadQuestion) console.log('[RAG] broad overview question detected');
 
   // ── 7. Topic-aware routing ────────────────────────────────────────────────
   // For "What is X?" style questions, try to find the exact document about X
@@ -542,10 +638,9 @@ export async function retrieveRelevantChunks(
         c => c.document_id != null && matchedDocIds.has(c.document_id),
       );
       if (topicCandidates.length > 0) {
-        // Score within the matched document only — picks the best chunk but
-        // returns it regardless of the normal MIN_SCORE threshold, because the
-        // document match itself is the authoritative relevance signal.
-        const { chunks: topicChunks } = rankAndSelect(topicCandidates, question);
+        const { chunks: topicChunks } = rankAndSelect(topicCandidates, question, broadQuestion);
+        // Restore natural reading order after scoring
+        topicChunks.sort((a, b) => (a.chunk_index ?? 0) - (b.chunk_index ?? 0));
         console.log('[RAG] topic routing → returning', topicChunks.length, 'chunk(s) from matched document');
         return topicChunks;
       }
@@ -555,7 +650,7 @@ export async function retrieveRelevantChunks(
   }
 
   // ── 8. Normal IDF scoring ────────────────────────────────────────────────
-  const { chunks, bestScore } = rankAndSelect(candidates, question);
+  const { chunks, bestScore } = rankAndSelect(candidates, question, broadQuestion);
 
   if (bestScore < MIN_SCORE) {
     console.log(`[RAG] score ${bestScore.toFixed(2)} below threshold ${MIN_SCORE} — no match`);

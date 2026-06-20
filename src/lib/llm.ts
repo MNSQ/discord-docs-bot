@@ -20,9 +20,10 @@ Synthesize the documentation into a clear, natural answer — do not copy-paste 
 
 Match answer length to the question:
 • Simple factual (yes/no, a name, a location, a single setting): 1–2 sentences.
-• "What is" or "how does": a short paragraph of 3–5 sentences explaining what it is, why it matters, and how it works if the docs say so.
+• "What is" or "how does" for a specific feature: a short paragraph of 3–5 sentences — what it is, why it matters, how it works.
+• Overview or "tell me about" questions: synthesize across all provided passages into 2–3 paragraphs covering what it is, what it does, who uses it, and key capabilities — include only points supported by the provided context.
 • Steps, configuration, requirements, options, causes, or troubleshooting: one short intro sentence, then bullet points — one item per line, each starting with "•".
-• Broad or multi-part question: up to 2 compact paragraphs, or a paragraph followed by bullets.
+• Multi-part or broad questions: up to 3 compact paragraphs, or a paragraph followed by bullets.
 
 Use bullet points when the answer naturally contains a list of separate items, steps, or options. Use a paragraph when the answer flows as continuous prose. Do not force bullets when they would break up a naturally connected explanation.
 
@@ -67,7 +68,7 @@ export async function generateAnswer(
   const sourceUrl = chunks[0]?.source_url ?? null;
 
   const docText   = cleanContent(chunks.map(c => c.content).join('\n\n'));
-  const cappedDoc = docText.length > 3000 ? docText.slice(0, 3000) + '…' : docText;
+  const cappedDoc = docText.length > 5000 ? docText.slice(0, 5000) + '…' : docText;
 
   const sourceHint = sourceUrl ? `\n\nSource URL: ${sourceUrl}` : '';
   const userMessage = `Documentation:\n${cappedDoc}${sourceHint}\n\nQuestion: ${question}`;
@@ -96,7 +97,7 @@ export async function generateAnswer(
         format: 'json',
         options: {
           temperature: 0.1,
-          num_predict: 700,
+          num_predict: 1200,
           num_ctx:     8192,
         },
         messages: [
