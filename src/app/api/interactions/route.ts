@@ -1,4 +1,5 @@
-import { NextRequest, NextResponse, after } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
+import { waitUntil } from '@vercel/functions';
 import nacl from 'tweetnacl';
 import { retrieveRelevantChunks, cleanContent, type Chunk } from '@/lib/rag';
 import { logUsage } from '@/lib/usage';
@@ -102,6 +103,7 @@ async function handleAskInteraction(interaction: Record<string, unknown>): Promi
 
   try {
     const chunks = await retrieveRelevantChunks(question, discordGuildId);
+    console.log('[discord] retrieve complete');
 
     if (chunks === null) {
       console.log('[/ask] retrieval → null (no docs for this guild)');
@@ -126,12 +128,16 @@ async function handleAskInteraction(interaction: Record<string, unknown>): Promi
     } else if (chunks.length === 0) {
       content = REFUSAL;
     } else {
+      console.log('[discord] calling generateAnswer');
       const answer = await generateAnswer(question, chunks);
+      console.log('[discord] generateAnswer complete');
       if (!answer) console.log('[/ask] LLM returned null — using fallback');
       content = answer ?? buildFallback(chunks);
     }
 
+    console.log('[discord] calling patchReply');
     await patchReply(token, content);
+    console.log('[discord] patchReply succeeded');
   } catch (err) {
     console.error('[discord] background failed:', err);
     await patchReply(token, REFUSAL).catch(() => {});
@@ -166,8 +172,8 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ type: 4, data: { content: 'Please provide a question.' } });
       }
 
-      // 3. Schedule slow work to run after the response is sent (Vercel-safe)
-      after(() => { void handleAskInteraction(interaction); });
+      // 3. Keep the Vercel function alive until the background task settles
+      waitUntil(handleAskInteraction(interaction));
 
       // 4. Return deferred response immediately — Discord 3-second window
       console.log('[discord] returning deferred response now');
