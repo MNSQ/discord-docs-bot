@@ -8,6 +8,7 @@
     "start": "next start",
     "lint": "eslint",
     "register": "node scripts/register-commands.mjs",
+    "discord:register:global": "node scripts/register-commands.mjs --global",
     "clear-global-commands": "node scripts/clear-global-commands.mjs",
     "gateway": "node scripts/ollama-gateway.mjs"
   },

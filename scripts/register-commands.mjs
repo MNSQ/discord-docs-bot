@@ -1,18 +1,20 @@
-// Registers slash commands with Discord's global command endpoint.
-// Global commands propagate to all servers within ~1 hour.
-// Run: npm run register
+// Registers slash commands with Discord.
 //
-// To register instantly to one guild for testing, set DISCORD_GUILD_ID in
-// .env.local and the script will use the guild-scoped endpoint instead.
+// Guild mode (fast, test-only):
+//   npm run register              ← uses DISCORD_GUILD_ID from .env.local
+//
+// Global mode (all servers, propagates within ~1 hour):
+//   npm run discord:register:global   ← ignores DISCORD_GUILD_ID
 
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 loadDotEnv('.env.local');
 
-const appId = process.env.DISCORD_APPLICATION_ID;
-const token = process.env.DISCORD_BOT_TOKEN;
-const guildId = process.env.DISCORD_GUILD_ID; // optional
+const appId   = process.env.DISCORD_APPLICATION_ID;
+const token   = process.env.DISCORD_BOT_TOKEN;
+const forceGlobal = process.argv.includes('--global');
+const guildId = forceGlobal ? null : (process.env.DISCORD_GUILD_ID ?? null);
 
 if (!appId || !token) {
   console.error('DISCORD_APPLICATION_ID and DISCORD_BOT_TOKEN must be set in .env.local');
@@ -40,8 +42,8 @@ const endpoint = guildId
 
 console.log(
   guildId
-    ? `Registering commands to guild ${guildId} (instant)...`
-    : 'Registering global commands (takes up to 1 hour to propagate)...',
+    ? `Registering guild commands for ${guildId}`
+    : 'Registering global commands',
 );
 
 const res = await fetch(endpoint, {
