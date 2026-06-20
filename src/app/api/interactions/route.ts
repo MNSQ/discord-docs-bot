@@ -1,4 +1,4 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest, NextResponse, after } from 'next/server';
 import nacl from 'tweetnacl';
 import { retrieveRelevantChunks, cleanContent, type Chunk } from '@/lib/rag';
 import { logUsage } from '@/lib/usage';
@@ -166,8 +166,8 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ type: 4, data: { content: 'Please provide a question.' } });
       }
 
-      // 3. Start all slow work in the background — do NOT await
-      void handleAskInteraction(interaction);
+      // 3. Schedule slow work to run after the response is sent (Vercel-safe)
+      after(() => { void handleAskInteraction(interaction); });
 
       // 4. Return deferred response immediately — Discord 3-second window
       console.log('[discord] returning deferred response now');
