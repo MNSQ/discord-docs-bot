@@ -1,6 +1,7 @@
 'use client';
 
 import { useRef, useState } from 'react';
+import { BTN_PRIMARY, StatusMessage } from './DocsForm';
 
 interface Props {
   guildId: string;
@@ -9,7 +10,7 @@ interface Props {
 
 export default function FileImportForm({ guildId, onSuccess }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
-  const [status, setStatus] = useState<'idle' | 'uploading' | 'ok' | 'error'>('idle');
+  const [status,  setStatus]  = useState<'idle' | 'uploading' | 'ok' | 'error'>('idle');
   const [message, setMessage] = useState('');
 
   function openPicker() {
@@ -31,15 +32,11 @@ export default function FileImportForm({ guildId, onSuccess }: Props) {
     setStatus('uploading');
     setMessage('');
 
-    const formData = new FormData();
-    formData.append('file', file);
-    formData.append('guild_id', guildId);
+    const form = new FormData();
+    form.append('file', file);
+    form.append('guild_id', guildId);
 
-    const res = await fetch('/api/docs/import-file', {
-      method: 'POST',
-      body: formData,
-    });
-
+    const res  = await fetch('/api/docs/import-file', { method: 'POST', body: form });
     const data = await res.json();
 
     if (inputRef.current) inputRef.current.value = '';
@@ -56,46 +53,36 @@ export default function FileImportForm({ guildId, onSuccess }: Props) {
 
   return (
     <div className="flex flex-col gap-3">
-      <input
-        ref={inputRef}
-        type="file"
-        accept=".txt,.md,.docx"
-        onChange={handleChange}
-        style={{ display: 'none' }}
-      />
+      <input ref={inputRef} type="file" accept=".txt,.md,.docx" onChange={handleChange} className="hidden" />
 
-      <div
+      <button
+        type="button"
         onClick={openPicker}
-        role="button"
-        tabIndex={0}
-        onKeyDown={e => e.key === 'Enter' && openPicker()}
+        disabled={status === 'uploading'}
         className={[
-          'flex items-center justify-center gap-2 rounded-lg border-2 border-dashed',
-          'px-6 py-8 text-sm transition-colors select-none',
-          status === 'uploading'
-            ? 'border-zinc-300 dark:border-zinc-700 text-zinc-400 cursor-wait'
-            : 'border-zinc-300 dark:border-zinc-700 cursor-pointer',
-          status !== 'uploading'
-            ? 'hover:border-indigo-400 dark:hover:border-indigo-500 hover:text-indigo-600 dark:hover:text-indigo-400 text-zinc-500 dark:text-zinc-400'
-            : '',
+          'w-full flex flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed px-6 py-10',
+          'text-sm transition-colors cursor-pointer disabled:cursor-wait',
+          'border-zinc-300 dark:border-zinc-700',
+          'hover:border-indigo-400 dark:hover:border-indigo-600',
+          'hover:bg-indigo-50 dark:hover:bg-indigo-950/30',
+          'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500',
+          'text-zinc-500 dark:text-zinc-400 hover:text-indigo-600 dark:hover:text-indigo-400',
+          'disabled:opacity-60',
         ].join(' ')}
       >
         {status === 'uploading' ? (
           <span>Uploading…</span>
         ) : (
           <>
-            <span>Click to choose a file</span>
-            <span className="text-zinc-300 dark:text-zinc-600">·</span>
+            <span className="font-medium">Click to choose a file</span>
             <span className="text-xs text-zinc-400 dark:text-zinc-500">.txt · .md · .docx</span>
           </>
         )}
-      </div>
+      </button>
 
-      {message && (
-        <span className={`text-sm ${status === 'error' ? 'text-red-500' : 'text-green-600 dark:text-green-400'}`}>
-          {message}
-        </span>
-      )}
+      {message && <StatusMessage ok={status === 'ok'} message={message} />}
     </div>
   );
 }
+
+export { BTN_PRIMARY };
