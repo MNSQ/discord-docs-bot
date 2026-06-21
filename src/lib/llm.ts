@@ -4,7 +4,8 @@ const BASE_URL       = () => (process.env.OLLAMA_BASE_URL ?? 'http://localhost:1
 const MODEL          = () => process.env.OLLAMA_MODEL ?? 'qwen3:4b';
 const GATEWAY_SECRET = () => process.env.OLLAMA_GATEWAY_SECRET;
 
-const TIMEOUT_MS = 30_000;
+const TIMEOUT_MS  = 30_000;
+const FINAL_MARKER = 'FINAL_ANSWER:';
 
 export const REFUSAL = 'I could not find this in the available documentation.';
 
@@ -12,27 +13,29 @@ export const REFUSAL = 'I could not find this in the available documentation.';
 
 const SYSTEM_PROMPT = `You are a Discord documentation assistant. Answer only from the provided documentation.
 
-Your first sentence must be the answer itself. Do not start with meta commentary.
-Forbidden openings: "We are given", "I need to", "Let me", "The question", "The user", "From the documentation", "Section", "We have to", "First, note".
+Your first sentence must be the answer itself. Forbidden openings: "We are given", "We have", "We must", "I need to", "Let me", "The question", "The user", "From the documentation", "Section", "First, note", "Key points".
 
 Never mention section numbers like [1], [2], [3]. Do not reference sections or chunks at all.
-Do not show your reasoning or analysis. Write the final answer directly.
+Do not show reasoning. Do not describe your process.
 
 Silently treat "ionet", "io net", "IONET", and "IO.NET" as the same project. Use "io.net" as the canonical name.
 
 If the documentation does not contain the answer, say: "${REFUSAL}"
 
-For broad questions like "tell me about io.net", write 1–3 useful paragraphs.
-For setup or configuration questions, use clear steps.
-For specific questions, answer directly and concisely.
+For broad questions, write 1–3 useful paragraphs. For specific questions, answer directly.
 
-Return only the final plain text answer. No JSON.`;
+Return your final user-facing answer ONLY after this exact marker on its own line:
 
-const RETRY_SUFFIX_MESSAGE =
-  'Your previous response included analysis or section references. ' +
-  'Return only the final user-facing answer. ' +
-  'Do not mention the question, sections, documentation chunks, reasoning, or your process. ' +
-  'Start directly with the answer.';
+${FINAL_MARKER}
+
+Do not write anything before ${FINAL_MARKER}. Do not include the marker itself in your answer.`;
+
+const RETRY_USER_MESSAGE =
+  `Your previous response included analysis or section references instead of a direct answer.\n\n` +
+  `Return ONLY this format — nothing else:\n\n` +
+  `${FINAL_MARKER}\n` +
+  `<the final user-facing answer here>\n\n` +
+  `No analysis. No section numbers. No explanation of your process. The answer starts immediately after ${FINAL_MARKER}.`;
 
 // ─── Fragment detection ───────────────────────────────────────────────────────
 
@@ -65,91 +68,115 @@ function buildUserMessage(question: string, chunks: Chunk[]): string {
   return [
     `Question:\n${question}`,
     `Documentation:\n${sections.join('\n\n')}`,
-    'Answer the question using only the documentation above. Do not mention section numbers, analysis, or reasoning.',
+    `Answer using only the documentation above.\n\n${FINAL_MARKER}\n<your answer here>`,
   ].join('\n\n');
 }
 
-// ─── Cleaning ─────────────────────────────────────────────────────────────────
+// ─── Reasoning patterns ───────────────────────────────────────────────────────
 
-export function cleanAnswer(raw: string): string {
-  let t = raw ?? '';
-
-  // Step 1: discard everything before the last </think> (Qwen3 reasoning prefix)
-  const lastClose = t.lastIndexOf('</think>');
-  const strippedThink = lastClose !== -1;
-  if (strippedThink) t = t.slice(lastClose + '</think>'.length);
-  console.log('[LLM] stripped thinking prefix:', strippedThink);
-
-  // Step 2: remove any remaining paired <think>...</think> blocks
-  t = t.replace(/<think>[\s\S]*?<\/think>/gi, '');
-
-  // Step 3: unwrap Markdown code fences (keep inner text)
-  t = t.replace(/```(?:\w+)?\s*([\s\S]*?)```/g, '$1');
-
-  // Step 4: strip leading "Answer:" prefix the model may add
-  t = t.replace(/^(?:final\s+)?answer\s*[:：]\s*/i, '');
-
-  return t.trim();
-}
-
-// ─── Untagged reasoning sanitiser ────────────────────────────────────────────
-
-const REASONING_PREFIXES = [
-  // Explicit analysis openers
+const REASONING_PATTERNS: string[] = [
+  'we have documentation',
+  'we must answer',
+  'we are given',
+  'we have to answer',
+  'we have to',
+  'first, note',
+  'from the provided documentation',
+  'looking through',
   'let me analyze',
+  "let's analyze",
   'i need to analyze',
   'i need to',
-  'i should',
-  "i'll craft",
-  'looking through',
-  'looking at',
-  // "We" phrasing the model uses when it leaks prompt-following reasoning
-  'we are given',
-  'we have to',
-  // Section/chunk references
-  'section [',
-  'from section',
-  'the most relevant section',
-  'key points from the documentation',
-  // "The question / user" meta-commentary
   'the question is',
   'the question asks',
   'the user asks',
   'the user is asking',
-  // Documentation meta-references
-  'from the provided documentation',
-  'based on the documentation sections',
-  'based on the provided documentation',
-  // Process commentary
-  'first, note that',
-  'the final answer',
-  'final answer:',
+  'section [',
+  'key points from',
+  "let's structure",
+  'now write',
+  'final answer:',     // catches "Final answer: ..." (lower-case, not our ALL-CAPS marker)
+  'based on section',
+  'documentation sections',
 ];
 
-function isReasoningParagraph(para: string): boolean {
-  const lower = para.trim().toLowerCase();
-  if (REASONING_PREFIXES.some(p => lower.startsWith(p))) return true;
-  // Paragraph starting with a bare section reference like "[1]", "[2] ..."
-  if (/^\[\d+\]/.test(para.trim())) return true;
+export function detectReasoning(text: string): boolean {
+  const sample = text.slice(0, 1200).toLowerCase();
+  if (REASONING_PATTERNS.some(p => sample.includes(p))) return true;
+  // Section references like [1], [2], [3] in first 1200 chars
+  if (/\[\d+\]/.test(text.slice(0, 1200))) return true;
   return false;
 }
 
-export function sanitizeFinalAnswer(text: string): string {
-  const paragraphs = text.split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
-  if (paragraphs.length === 0) {
-    throw new Error('[LLM] rejection reason: reasoning leak without clean final answer');
+// ─── Marker extraction ────────────────────────────────────────────────────────
+// Takes raw model output (after think-block stripping) and returns text after
+// the LAST occurrence of FINAL_MARKER. Also returns whether the marker was found.
+
+export function extractFinalAnswer(raw: string): { text: string; markerFound: boolean } {
+  const idx = raw.lastIndexOf(FINAL_MARKER);
+  if (idx !== -1) {
+    return { text: raw.slice(idx + FINAL_MARKER.length).trim(), markerFound: true };
   }
+  return { text: raw.trim(), markerFound: false };
+}
 
-  // Fast path: no reasoning in first paragraph
-  if (!isReasoningParagraph(paragraphs[0])) return text;
+// ─── Think-block stripping ────────────────────────────────────────────────────
+// Exported so tests and the debug route can call it independently.
 
-  const clean = paragraphs.filter(p => !isReasoningParagraph(p));
-  if (clean.length === 0) {
-    throw new Error('[LLM] rejection reason: reasoning leak without clean final answer');
-  }
+export function stripThinkBlocks(raw: string): { text: string; strippedThink: boolean } {
+  let t = raw ?? '';
 
-  console.log('[LLM] sanitized reasoning leak: stripped', paragraphs.length - clean.length, 'paragraph(s)');
-  return clean.join('\n\n');
+  // Discard everything before the last </think> (Qwen3 extended-thinking prefix)
+  const lastClose = t.lastIndexOf('</think>');
+  const strippedThink = lastClose !== -1;
+  if (strippedThink) t = t.slice(lastClose + '</think>'.length);
+
+  // Remove any fully paired <think>...</think> blocks
+  t = t.replace(/<think>[\s\S]*?<\/think>/gi, '');
+
+  return { text: t.trim(), strippedThink };
+}
+
+// ─── cleanAnswer (exported for debug route) ───────────────────────────────────
+// Applies all text-level cleaning to an already-extracted answer snippet.
+// Does NOT strip FINAL_MARKER (caller has already extracted past it).
+
+export function cleanAnswer(text: string): string {
+  let t = text;
+  // Unwrap Markdown code fences (keep inner text)
+  t = t.replace(/```(?:\w+)?\s*([\s\S]*?)```/g, '$1');
+  // Strip leading "Answer:" prefix the model may add even after the marker
+  t = t.replace(/^(?:final\s+)?answer\s*[:：]\s*/i, '');
+  return t.trim();
+}
+
+// ─── Full processing pipeline ─────────────────────────────────────────────────
+// Used by both attempts so the logic stays in one place.
+
+interface ProcessResult {
+  answer:           string;
+  markerFound:      boolean;
+  strippedThink:    boolean;
+  reasoningDetected: boolean;
+}
+
+export function processModelOutput(raw: string): ProcessResult {
+  // 1. Strip think blocks
+  const { text: thinkStripped, strippedThink } = stripThinkBlocks(raw);
+  console.log('[LLM] stripped thinking prefix:', strippedThink);
+
+  // 2. Extract after FINAL_MARKER (uses lastIndexOf so repeated markers work)
+  const { text: extracted, markerFound } = extractFinalAnswer(thinkStripped);
+  console.log('[LLM] final marker found:', markerFound);
+
+  // 3. Clean the extracted portion
+  const answer = cleanAnswer(extracted);
+
+  // 4. Detect reasoning in first 1200 chars of the extracted/cleaned answer
+  const reasoningDetected = detectReasoning(answer);
+  console.log('[LLM] reasoning detected before final answer:', reasoningDetected);
+
+  return { answer, markerFound, strippedThink, reasoningDetected };
 }
 
 // ─── Intent-aware source selection ───────────────────────────────────────────
@@ -161,25 +188,21 @@ function chooseBestSource(
 ): string | null {
   const q = question.toLowerCase();
 
-  // Collect unique source URLs in the order chunks were selected
   const seen = new Set<string>();
   const candidates = chunks
     .filter(c => c.source_url && !seen.has(c.source_url) && (seen.add(c.source_url), true))
     .map(c => ({ url: c.source_url!, text: `${c.title ?? ''} ${c.source_url ?? ''}`.toLowerCase() }));
 
-  console.log(
-    '[source] candidates:',
-    candidates.map(c => c.url).join(' | ') || '(none)',
-  );
+  console.log('[source] candidates:', candidates.map(c => c.url).join(' | ') || '(none)');
 
   if (candidates.length === 0) {
     console.log('[source] rejected reason: no source URLs in selected chunks');
     return null;
   }
 
-  const isVm         = /\bvm\b|virtual.machine|on.?demand|cloud.?vm|deploy.?vm|spin.?up|cloud.?instance/.test(q);
+  const isVm         = /\bvm\b|virtual.machine|on.?demand|cloud.?vm|deploy.?vm|spin.?up/.test(q);
   const isTokenomics = /\btoken|tokenomics|emission|staking|supply\b|coin\b|vesting|airdrop|\breward/.test(q);
-  const isIntelligence = /io.?intelligence|ai.?access|\bmodels?\b|api.?key|inference/.test(q);
+  const isIntel      = /io.?intelligence|ai.?access|\bmodels?\b|api.?key|inference/.test(q);
   const isInstall    = /\binstall|ubuntu|hiveos|worker.?setup|set.?up.?worker|add.?worker/.test(q);
 
   const INSTALL_SIGNALS = ['ubuntu', 'hiveos', 'install-worker', 'worker-setup', 'nvidia', 'install-on', 'run-worker'];
@@ -187,12 +210,10 @@ function chooseBestSource(
   if (isVm) {
     const ACCEPT = ['vm', 'virtual-machine', 'deploy-vm', 'on-demand', 'cloud'];
     const REJECT = ['staking', 'tokenomics', 'co-staking', 'emission', ...INSTALL_SIGNALS];
-    for (const c of candidates) {
-      if (ACCEPT.some(s => c.text.includes(s)) && !REJECT.some(s => c.text.includes(s))) {
-        console.log('[source] selected (vm intent):', c.url);
-        return c.url;
-      }
-    }
+    const match = candidates.find(c =>
+      ACCEPT.some(s => c.text.includes(s)) && !REJECT.some(s => c.text.includes(s)),
+    );
+    if (match) { console.log('[source] selected (vm intent):', match.url); return match.url; }
     console.log('[source] rejected reason: no VM-relevant source among candidates');
     return null;
   }
@@ -200,35 +221,25 @@ function chooseBestSource(
   if (isTokenomics) {
     const ACCEPT = ['tokenomics', 'token', 'emission', 'staking', 'coin', 'supply', 'vesting', 'airdrop', 'monthly'];
     const REJECT = [...INSTALL_SIGNALS];
-    for (const c of candidates) {
-      if (ACCEPT.some(s => c.text.includes(s)) && !REJECT.some(s => c.text.includes(s))) {
-        console.log('[source] selected (tokenomics intent):', c.url);
-        return c.url;
-      }
-    }
-    // No tokenomics-specific source — fall through to default
+    const match = candidates.find(c =>
+      ACCEPT.some(s => c.text.includes(s)) && !REJECT.some(s => c.text.includes(s)),
+    );
+    if (match) { console.log('[source] selected (tokenomics intent):', match.url); return match.url; }
   }
 
-  if (isIntelligence) {
+  if (isIntel) {
     const ACCEPT = ['intelligence', 'ai-access', 'models', 'api-key', 'inference', 'payment', 'rate'];
     const REJECT = ['staking', 'tokenomics', ...INSTALL_SIGNALS];
-    for (const c of candidates) {
-      if (ACCEPT.some(s => c.text.includes(s)) && !REJECT.some(s => c.text.includes(s))) {
-        console.log('[source] selected (intelligence intent):', c.url);
-        return c.url;
-      }
-    }
-    // Fall through to default
+    const match = candidates.find(c =>
+      ACCEPT.some(s => c.text.includes(s)) && !REJECT.some(s => c.text.includes(s)),
+    );
+    if (match) { console.log('[source] selected (intelligence intent):', match.url); return match.url; }
   }
 
-  // For non-install questions, refuse to link to install/worker-setup pages
   if (!isInstall && defaultSource) {
     if (INSTALL_SIGNALS.some(s => defaultSource.toLowerCase().includes(s))) {
       const fallback = candidates.find(c => !INSTALL_SIGNALS.some(s => c.text.includes(s)));
-      if (fallback) {
-        console.log('[source] selected (fallback, avoiding install doc):', fallback.url);
-        return fallback.url;
-      }
+      if (fallback) { console.log('[source] selected (fallback, avoiding install):', fallback.url); return fallback.url; }
       console.log('[source] rejected reason: default is install doc and no alternative found');
       return null;
     }
@@ -238,20 +249,18 @@ function chooseBestSource(
   return defaultSource;
 }
 
-// ─── Ollama fetch helper ──────────────────────────────────────────────────────
-// Makes one request, returns cleaned + sanitized answer text.
-// Throws on every failure path so the caller can decide whether to retry.
+// ─── Ollama fetch (one attempt) ───────────────────────────────────────────────
 
-type OllamaMessage = { role: string; content: string };
+type OllamaMsg = { role: string; content: string };
 
-async function fetchAndClean(
+async function fetchOllama(
   url: string,
   headers: Record<string, string>,
   model: string,
-  messages: OllamaMessage[],
-  attempt: number,
+  messages: OllamaMsg[],
+  attemptNum: number,
 ): Promise<string> {
-  console.log(`[LLM] attempt ${attempt}: sending ${messages.length}-message conversation`);
+  console.log(`[LLM] attempt ${attemptNum}: sending request`);
 
   const controller = new AbortController();
   const timer      = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -279,7 +288,7 @@ async function fetchAndClean(
   }
   clearTimeout(timer);
 
-  console.log(`[LLM] attempt ${attempt}: HTTP status ${res.status}`);
+  console.log(`[LLM] attempt ${attemptNum}: HTTP ${res.status}`);
 
   if (!res.ok) {
     const body = await res.text().catch(() => '(unreadable)');
@@ -287,13 +296,10 @@ async function fetchAndClean(
   }
 
   let data: Record<string, unknown>;
-  try {
-    data = (await res.json()) as Record<string, unknown>;
-  } catch (err) {
-    throw new Error(`[LLM] could not parse gateway response — ${err}`);
-  }
+  try { data = (await res.json()) as Record<string, unknown>; }
+  catch (err) { throw new Error(`[LLM] could not parse gateway JSON — ${err}`); }
 
-  console.log(`[LLM] attempt ${attempt}: response keys =`, Object.keys(data).join(', '));
+  console.log(`[LLM] attempt ${attemptNum}: response keys =`, Object.keys(data).join(', '));
 
   const msg = data.message;
   const chatContent =
@@ -302,13 +308,11 @@ async function fetchAndClean(
       : '';
 
   const rawText =
-    typeof chatContent === 'string' && chatContent.trim()
-      ? chatContent
-      : typeof data.response === 'string' && (data.response as string).trim()
-      ? (data.response as string)
-      : '';
+    typeof chatContent === 'string' && chatContent.trim() ? chatContent
+    : typeof data.response === 'string' && (data.response as string).trim() ? (data.response as string)
+    : '';
 
-  console.log(`[LLM] attempt ${attempt}: raw length =`, rawText.length);
+  console.log(`[LLM] attempt ${attemptNum}: raw length =`, rawText.length);
 
   if (!rawText.trim()) {
     throw new Error(
@@ -316,19 +320,10 @@ async function fetchAndClean(
     );
   }
 
-  const cleaned = cleanAnswer(rawText);
-  console.log(`[LLM] attempt ${attempt}: cleaned length =`, cleaned.length);
-
-  if (!cleaned.trim()) throw new Error('[LLM] rejection reason: cleaned answer is empty');
-  if (/<\/?think\b/i.test(cleaned)) throw new Error('[LLM] rejection reason: residual <think> tag');
-  if (/^Reasoning\s*:/im.test(cleaned)) throw new Error('[LLM] rejection reason: Reasoning: bleed-through');
-
-  // May throw "[LLM] rejection reason: reasoning leak without clean final answer"
-  return sanitizeFinalAnswer(cleaned);
+  return rawText;
 }
 
 // ─── Main export ──────────────────────────────────────────────────────────────
-// Throws on unrecoverable failures. Retries once on reasoning-leak errors.
 
 export async function generateAnswer(
   question: string,
@@ -338,10 +333,7 @@ export async function generateAnswer(
   const model   = MODEL();
   const baseUrl = BASE_URL();
   const url     = `${baseUrl}/api/chat`;
-
-  const hostname = (() => {
-    try { return new URL(baseUrl).hostname; } catch { return baseUrl; }
-  })();
+  const hostname = (() => { try { return new URL(baseUrl).hostname; } catch { return baseUrl; } })();
 
   console.log('[LLM] request started');
   console.log('[LLM] gateway:', hostname);
@@ -354,44 +346,52 @@ export async function generateAnswer(
 
   const startMs = Date.now();
 
-  const baseMessages: OllamaMessage[] = [
+  const baseMessages: OllamaMsg[] = [
     { role: 'system', content: SYSTEM_PROMPT },
     { role: 'user',   content: buildUserMessage(question, chunks) },
   ];
 
   // ── Attempt 1 ─────────────────────────────────────────────────────────────
   let answer: string;
-  try {
-    answer = await fetchAndClean(url, headers, model, baseMessages, 1);
-    console.log('[LLM] attempt 1 succeeded');
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    const isReasoningLeak = msg.includes('reasoning leak');
+  {
+    const raw1 = await fetchOllama(url, headers, model, baseMessages, 1);
+    const { answer: a1, reasoningDetected, markerFound } = processModelOutput(raw1);
 
-    if (!isReasoningLeak) {
-      throw err; // network/HTTP/empty failures — no point retrying
-    }
+    if (reasoningDetected) {
+      console.warn('[LLM] retrying due to reasoning leak (attempt 1 marker found:', markerFound, ')');
 
-    // ── Attempt 2: stricter prompt ─────────────────────────────────────────
-    console.warn('[LLM] attempt 1 reasoning leak:', msg);
-    console.log('[LLM] retrying with stricter prompt');
+      // ── Attempt 2: stricter format instruction ─────────────────────────────
+      const retryMessages: OllamaMsg[] = [
+        ...baseMessages,
+        { role: 'assistant', content: a1 || '(no clean answer)' },
+        { role: 'user',      content: RETRY_USER_MESSAGE },
+      ];
 
-    const retryMessages: OllamaMessage[] = [
-      ...baseMessages,
-      { role: 'assistant', content: '(analysis omitted)' },
-      { role: 'user',      content: RETRY_SUFFIX_MESSAGE },
-    ];
+      const raw2 = await fetchOllama(url, headers, model, retryMessages, 2);
+      const result2 = processModelOutput(raw2);
 
-    try {
-      answer = await fetchAndClean(url, headers, model, retryMessages, 2);
-      console.log('[LLM] attempt 2 (retry) succeeded');
-    } catch (retryErr) {
-      const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
-      throw new Error(`[LLM] retry also failed: ${retryMsg}`);
+      console.log('[LLM] retry', result2.reasoningDetected ? 'rejected' : 'accepted');
+
+      if (result2.reasoningDetected) {
+        throw new Error('[LLM] rejection reason: reasoning leak after retry');
+      }
+      if (!result2.answer.trim()) {
+        throw new Error('[LLM] rejection reason: retry produced empty answer');
+      }
+
+      answer = result2.answer;
+    } else {
+      if (!a1.trim()) throw new Error('[LLM] rejection reason: empty answer after processing');
+      answer = a1;
     }
   }
 
   const durationMs = Date.now() - startMs;
+
+  // ── Residual tag guard ─────────────────────────────────────────────────────
+  if (/<\/?think\b/i.test(answer)) {
+    throw new Error('[LLM] rejection reason: residual <think> tag in final answer');
+  }
 
   // ── Refusal ────────────────────────────────────────────────────────────────
   if (answer.includes(REFUSAL)) {
@@ -399,7 +399,7 @@ export async function generateAnswer(
     return REFUSAL;
   }
 
-  // ── Intent-aware source selection ──────────────────────────────────────────
+  // ── Source selection ───────────────────────────────────────────────────────
   const sourceUrl = chooseBestSource(question, chunks, bestSource);
 
   let final = answer;

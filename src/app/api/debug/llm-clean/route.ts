@@ -1,13 +1,22 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { cleanAnswer, sanitizeFinalAnswer } from '@/lib/llm';
+import { processModelOutput } from '@/lib/llm';
 
-// Dev-only endpoint for testing the answer post-processor.
-// POST { "input": "raw model output" } → { "input", "cleaned", "sanitized", "error?" }
+// Dev-only endpoint for testing the answer processing pipeline.
+// POST { "input": "raw model output" }
+// → { input, strippedThink, markerFound, reasoningDetected, answer, error? }
 //
-// Example inputs to test:
-//   "Let me analyze the documentation...\n\nSection [1] is...\n\nThe IO tokenomics of io.net are..."
+// Test cases:
+//   "Let me analyze the documentation...\n\nFINAL_ANSWER:\nio.net is a decentralized compute network..."
+//   → markerFound: true, reasoningDetected: false, answer: "io.net is a decentralized..."
+//
+//   "We are given a question...\n\nFrom the provided documentation..."
+//   → markerFound: false, reasoningDetected: true
+//
 //   "</think>\n\nio.net is a decentralized compute network..."
-//   "The most relevant section is [6]...\n\nYes, io.net offers VM on demand."
+//   → strippedThink: true, markerFound: false, reasoningDetected: false
+//
+//   "The most relevant section is [6]...\n\nFINAL_ANSWER:\nYes, io.net offers VM on demand."
+//   → markerFound: true, reasoningDetected: false, answer: "Yes, io.net offers VM on demand."
 
 export async function POST(req: NextRequest) {
   if (process.env.NODE_ENV !== 'development') {
@@ -25,15 +34,13 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: '"input" must be a string' }, { status: 400 });
   }
 
-  const input = body.input;
-
   try {
-    const cleaned   = cleanAnswer(input);
-    const sanitized = sanitizeFinalAnswer(cleaned);
-    return NextResponse.json({ input, cleaned, sanitized });
+    const result = processModelOutput(body.input);
+    return NextResponse.json({ input: body.input, ...result });
   } catch (err) {
-    const error = err instanceof Error ? err.message : String(err);
-    const cleaned = (() => { try { return cleanAnswer(input); } catch { return '(cleanAnswer threw)'; } })();
-    return NextResponse.json({ input, cleaned, sanitized: null, error }, { status: 422 });
+    return NextResponse.json(
+      { input: body.input, error: err instanceof Error ? err.message : String(err) },
+      { status: 422 },
+    );
   }
 }
