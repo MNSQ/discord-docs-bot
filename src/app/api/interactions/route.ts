@@ -127,6 +127,9 @@ async function handleAskInteraction(interaction: Record<string, unknown>): Promi
         console.log('[/ask] answer source: LLM');
         content = answer;
       } else {
+        console.error('[/ask] LLM returned null for question:', JSON.stringify(question),
+          '| chunks:', chunks.length,
+          '| sources:', chunks.map(c => c.source_url).filter(Boolean).join(', ') || '(none)');
         console.log('[/ask] answer source: LLM_FAILED — returning graceful error');
         content = 'I found relevant documentation, but I could not generate a proper answer right now. Please try again in a moment.';
       }

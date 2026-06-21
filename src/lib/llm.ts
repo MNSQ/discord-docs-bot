@@ -1,4 +1,4 @@
-import { cleanContent, type Chunk } from './rag';
+import { type Chunk } from './rag';
 
 const BASE_URL       = () => (process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434').replace(/\/$/, '');
 const MODEL          = () => process.env.OLLAMA_MODEL ?? 'qwen3:4b';
@@ -8,52 +8,45 @@ const TIMEOUT_MS = 30_000;
 
 export const REFUSAL = 'I could not find this in the available documentation.';
 
-const SYSTEM_PROMPT = `You are a documentation assistant answering questions from Discord users.
+// ─── Prompts ──────────────────────────────────────────────────────────────────
 
-RESPONSE FORMAT
-Return valid JSON only, with this exact structure:
-{"answer": "your full answer here"}
-No text outside the JSON object. No code fences.
+const SYSTEM_PROMPT = `You are the documentation assistant for a Discord server. You answer only from the provided documentation chunks.
 
-WRITING THE ANSWER
-Synthesize the documentation into a clear, natural answer. Combine information across ALL provided passages — do not base your answer on a single passage when several are available. Never copy-paste a raw passage verbatim. Fix any awkward phrasing from document boundaries. Write as if explaining to a knowledgeable colleague.
+Rules:
+- Read all provided chunks before answering.
+- Combine the useful information into one clear answer.
+- Do not copy one chunk verbatim.
+- Do not start with a broken fragment.
+- If a chunk begins mid-sentence, silently repair the flow or ignore that fragment.
+- If the question is broad, give a broad explanation using all relevant chunks.
+- If the question is specific, answer directly.
+- If the docs do not contain the answer, say: "${REFUSAL}"
+- Do not invent facts outside the docs.
+- Do not mention chunks, retrieval, context, or internal processing.
+- Do not include source URLs in the answer; the app adds sources separately.
+- Output only the final answer.`;
 
-Match answer length to the question:
-• Simple factual (yes/no, a name, a location, a single setting): 1–2 sentences.
-• "What is" or "how does" for a specific feature: a short paragraph of 3–5 sentences — what it is, why it matters, how it works.
-• Overview or "tell me about" questions: synthesize across ALL provided passages into 2–4 paragraphs covering what it is, what it does, who uses it, and key capabilities. Draw from every relevant passage — do not focus on one alone. Include only points supported by the provided context.
-• Steps, configuration, requirements, options, causes, or troubleshooting: one short intro sentence, then bullet points — one item per line, each starting with "•".
-• Multi-part or broad questions: up to 3 compact paragraphs, or a paragraph followed by bullets.
+function buildUserMessage(question: string, chunks: Chunk[]): string {
+  const blocks = markFragmentStarts(chunks)
+    .map((c, i) => {
+      const title  = c.title     ?? 'Untitled';
+      const source = c.source_url ?? 'unknown';
+      return `[${i + 1}] Title: ${title}\nSource: ${source}\nContent:\n${c.content}`;
+    })
+    .join('\n\n');
 
-Use bullet points when the answer naturally contains a list of separate items, steps, or options. Use a paragraph when the answer flows as continuous prose. Do not force bullets when they would break up a naturally connected explanation.
+  const capped = blocks.length > 5000 ? blocks.slice(0, 5000) + '\n…' : blocks;
 
-HANDLING FRAGMENT PASSAGES
-Some passages may start mid-sentence (e.g., "net proposes…" when the full text is "io.net proposes…") due to how documentation was split. When you encounter such a fragment:
-• Do NOT open your answer with it.
-• Do NOT start your answer with a lowercase letter or a dangling continuation.
-• Extract only the complete, meaningful information it contains and weave it in naturally.
-• If a fragment is too broken to interpret, skip it entirely.
-
-STYLE RULES
-• Do not open with "Based on the documentation", "According to the docs", or similar filler.
-• Do not mention JSON, chunks, context, retrieval, system instructions, or your own reasoning process.
-• Do not use markdown code fences or raw markdown heading syntax (##, ###).
-• Use a short plain-text heading only when the answer covers genuinely distinct sections.
-• Bold a word or phrase only when it makes a specific key term stand out — not at random and not at the start of every sentence.
-• If the docs contain only partial information, explain what they do say and clearly state what is not specified.
-• Do not invent details absent from the documentation.
-• Do not include any URLs in the answer — source links are appended separately.
-
-REFUSAL
-If the context does not contain enough information to answer the question, return exactly:
-{"answer": "${REFUSAL}"}`;
+  return [
+    `Question:\n${question}`,
+    `Documentation:\n${capped}`,
+    'Now write the best possible answer using only the documentation above.',
+    'Answer style:\n- For "tell me about X", "what is X", or "explain X": write 1–3 solid paragraphs.\n- For setup/configuration questions: use clear steps.\n- For comparisons or lists: use bullets.\n- Keep the answer concise but useful.\n- Prefer natural explanation over raw documentation wording.',
+  ].join('\n\n');
+}
 
 // ─── Fragment detection ───────────────────────────────────────────────────────
-//
-// Chunks that start with a lowercase letter are continuation fragments produced
-// when the sentence splitter incorrectly broke on an abbreviation like "io.net".
-// Prefix them with "…" so the LLM sees them as mid-sentence continuations and
-// does not open its answer with the broken fragment.
+
 function markFragmentStarts(chunks: Chunk[]): Chunk[] {
   return chunks.map(c => {
     const trimmed = c.content.trimStart();
@@ -62,20 +55,71 @@ function markFragmentStarts(chunks: Chunk[]): Chunk[] {
   });
 }
 
-// ─── Reasoning leak detection ─────────────────────────────────────────────────
+// ─── Answer extraction ────────────────────────────────────────────────────────
 
-const REASONING_MARKERS = [
-  'hmm',
-  "the user is asking",
-  'i should',
-  'i need to',
-  'looking at the context',
-  'therefore',
-];
+// Strips <think>...</think> blocks that Qwen3 can produce when thinking bleeds through.
+function stripThinkingBlocks(text: string): string {
+  return text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+}
 
-function hasReasoningLeak(text: string): boolean {
-  const lower = text.toLowerCase();
-  return REASONING_MARKERS.some(m => lower.includes(m));
+// Tolerant extraction: prefers JSON (any key), falls back to plain text.
+function extractAnswer(raw: string): string {
+  // 1. Strip thinking blocks
+  let text = stripThinkingBlocks(raw);
+
+  // 2. Strip Markdown code fences
+  text = text
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```\s*$/i, '')
+    .trim();
+
+  // 3. Try to parse as JSON
+  try {
+    const parsed = JSON.parse(text) as Record<string, unknown>;
+    for (const key of ['answer', 'content', 'message', 'response', 'text', 'result']) {
+      const val = parsed[key];
+      if (typeof val === 'string' && val.trim()) return val.trim();
+    }
+    // Parsed but no recognised key — fall through to plain text
+  } catch {
+    // Not JSON
+  }
+
+  // 4. Try to extract embedded JSON object containing a known key
+  const embedded = text.match(/\{[\s\S]*?"(?:answer|content|response|text)"[\s\S]*?\}/);
+  if (embedded) {
+    try {
+      const parsed = JSON.parse(embedded[0]) as Record<string, unknown>;
+      for (const key of ['answer', 'content', 'response', 'text']) {
+        const val = parsed[key];
+        if (typeof val === 'string' && val.trim()) return val.trim();
+      }
+    } catch {
+      // Ignore
+    }
+  }
+
+  // 5. Plain text — strip any "Answer:" prefix the model may have added
+  text = text.replace(/^(?:final\s+)?answer\s*[:：]\s*/i, '').trim();
+
+  return text;
+}
+
+// ─── Rejection checks ─────────────────────────────────────────────────────────
+
+// Rejects only for genuine failures — empty output, un-stripped thinking tags,
+// or an explicit "Reasoning:" bleed-through. Does NOT reject for minor formatting.
+function isRejectable(answer: string): { reject: boolean; reason: string } {
+  if (!answer) {
+    return { reject: true, reason: 'empty answer' };
+  }
+  if (/<think>/i.test(answer)) {
+    return { reject: true, reason: 'contains un-stripped <think> tag' };
+  }
+  if (/^Reasoning\s*:/im.test(answer)) {
+    return { reject: true, reason: 'starts with Reasoning: bleed-through' };
+  }
+  return { reject: false, reason: '' };
 }
 
 // ─── Main export ──────────────────────────────────────────────────────────────
@@ -85,17 +129,18 @@ export async function generateAnswer(
   chunks: Chunk[],
 ): Promise<string | null> {
   const model     = MODEL();
-  const url       = `${BASE_URL()}/api/chat`;
+  const baseUrl   = BASE_URL();
+  const url       = `${baseUrl}/api/chat`;
   const sourceUrl = chunks[0]?.source_url ?? null;
 
-  const docText   = cleanContent(markFragmentStarts(chunks).map(c => c.content).join('\n\n'));
-  const cappedDoc = docText.length > 5000 ? docText.slice(0, 5000) + '…' : docText;
+  const hostname = (() => {
+    try { return new URL(baseUrl).hostname; } catch { return baseUrl; }
+  })();
 
-  const sourceHint = sourceUrl ? `\n\nSource URL: ${sourceUrl}` : '';
-  const userMessage = `Documentation:\n${cappedDoc}${sourceHint}\n\nQuestion: ${question}`;
-
-  console.log('[LLM] model:', model, '| chunks:', chunks.length, '| source:', sourceUrl ?? 'none');
-  console.log('[LLM] requested JSON mode');
+  console.log('[LLM] request started');
+  console.log('[LLM] gateway:', hostname);
+  console.log('[LLM] model:', model);
+  console.log('[LLM] chunks:', chunks.length, '| best source:', sourceUrl ?? 'none');
 
   const startMs = Date.now();
 
@@ -108,14 +153,15 @@ export async function generateAnswer(
     const timer      = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
     const res = await fetch(url, {
-      method: 'POST',
+      method:  'POST',
       headers,
-      signal: controller.signal,
+      signal:  controller.signal,
       body: JSON.stringify({
         model,
-        stream: false,
-        think:  false,
-        format: 'json',
+        stream:  false,
+        think:   false,
+        // No format: "json" — plain text output is more reliable than constrained
+        // JSON decoding when the model may pick a different key or emit preamble.
         options: {
           temperature: 0.1,
           num_predict: 1200,
@@ -123,7 +169,7 @@ export async function generateAnswer(
         },
         messages: [
           { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user',   content: userMessage    },
+          { role: 'user',   content: buildUserMessage(question, chunks) },
         ],
       }),
     });
@@ -132,7 +178,8 @@ export async function generateAnswer(
     const durationMs = Date.now() - startMs;
 
     if (!res.ok) {
-      console.error(`[LLM] Ollama HTTP ${res.status} (${durationMs}ms):`, await res.text());
+      const body = await res.text();
+      console.error(`[LLM] request failed with error: HTTP ${res.status} — ${body}`);
       return null;
     }
 
@@ -140,50 +187,30 @@ export async function generateAnswer(
       message?: { content?: string; thinking?: string };
     };
 
-    if (data?.message?.thinking) {
-      console.log('[LLM] ignored thinking field if present');
-    }
-
-    const raw = data?.message?.content ?? '';
+    const raw = (data?.message?.content ?? '').trim();
+    console.log('[LLM] raw response length:', raw.length);
 
     if (!raw) {
-      console.error('[LLM] empty content from Ollama');
+      console.error('[LLM] request failed with error: empty content from model');
       return null;
     }
 
-    console.log('[LLM] raw (first 300):', JSON.stringify(raw.slice(0, 300)));
+    const answer = extractAnswer(raw);
+    console.log('[LLM] parsed answer length:', answer.length);
 
-    let parsed: Record<string, unknown>;
-    try {
-      // Strip code fences Ollama occasionally adds even in JSON mode
-      const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/i, '').trim();
-      parsed = JSON.parse(cleaned) as Record<string, unknown>;
-    } catch {
-      console.warn('[LLM] JSON parse failed');
+    const { reject, reason } = isRejectable(answer);
+    if (reject) {
+      console.warn('[LLM] parse failed with error: rejected —', reason);
       return null;
     }
 
-    console.log('[LLM] parsed JSON answer');
-
-    const answer = typeof parsed.answer === 'string' ? parsed.answer.trim() : '';
-
-    if (!answer) {
-      console.warn('[LLM] parsed.answer missing or empty');
-      return null;
-    }
-
-    if (hasReasoningLeak(answer)) {
-      console.warn('[LLM] rejected reasoning leak');
-      return null;
-    }
-
-    // If it's a refusal, return as-is (no source link)
-    if (answer === REFUSAL) {
+    // Return refusal as-is (no source link appended)
+    if (answer.includes(REFUSAL)) {
       console.log(`[LLM] refusal | ${durationMs}ms`);
       return REFUSAL;
     }
 
-    // Append source URL if not already present in the answer
+    // Append best source URL if not already present
     let final = answer;
     if (sourceUrl && !answer.includes(sourceUrl)) {
       final = `${answer}\n\nFor more information, check: ${sourceUrl}`;
@@ -192,15 +219,15 @@ export async function generateAnswer(
     // Discord hard limit
     if (final.length > 1900) final = final.slice(0, 1897) + '…';
 
-    console.log('[LLM] formatted (first 200):', JSON.stringify(final.slice(0, 200)));
     console.log(`[LLM] success | ${durationMs}ms | ${final.length} chars`);
     return final;
+
   } catch (err) {
     const durationMs = Date.now() - startMs;
     if (err instanceof Error && err.name === 'AbortError') {
-      console.error(`[LLM] timed out after ${TIMEOUT_MS / 1000}s (${durationMs}ms)`);
+      console.error(`[LLM] request failed with error: timed out after ${TIMEOUT_MS / 1000}s (${durationMs}ms)`);
     } else {
-      console.error(`[LLM] error (${durationMs}ms):`, err);
+      console.error(`[LLM] request failed with error (${durationMs}ms):`, err);
     }
     return null;
   }
