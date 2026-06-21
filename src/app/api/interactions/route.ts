@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { waitUntil } from '@vercel/functions';
 import nacl from 'tweetnacl';
-import { retrieveRelevantChunks, cleanContent, type Chunk } from '@/lib/rag';
+import { retrieveRelevantChunks } from '@/lib/rag';
 import { logUsage } from '@/lib/usage';
 import { generateAnswer, REFUSAL } from '@/lib/llm';
 
@@ -53,41 +53,16 @@ async function patchReply(token: string, content: string): Promise<void> {
   }
 }
 
-// ─── Fallback ─────────────────────────────────────────────────────────────────
+// ─── Intent detection (for logging) ──────────────────────────────────────────
 
-function buildFallback(chunks: Chunk[]): string {
-  const top = chunks[0];
-  if (!top) return REFUSAL;
-
-  let cleaned = cleanContent(top.content)
-    .replace(/^#+\s*.*/gm, '')
-    .replace(/^\s*[-*]\s+/gm, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-
-  if (!cleaned || cleaned.length < 30) return REFUSAL;
-
-  const sentences = cleaned.match(/[^.!?\n]{20,}[.!?]+(?:\s|$)/g) ?? [];
-  const excerpt = sentences
-    .map(s => s.trim())
-    .filter(s =>
-      !s.toLowerCase().startsWith('see ') &&
-      !s.toLowerCase().startsWith('note:') &&
-      s.length > 30 && s.length < 400,
-    )
-    .slice(0, 2)
-    .join(' ')
-    .trim();
-
-  if (!excerpt) return REFUSAL;
-
-  const parts = [excerpt];
-  if (top.source_url) {
-    parts.push('');
-    parts.push(`For more information, check: ${top.source_url}`);
-  }
-  const result = parts.join('\n');
-  return result.length > 1900 ? result.slice(0, 1897) + '…' : result;
+function detectIntent(question: string): string {
+  const q = question.toLowerCase();
+  const isTokenomics = /token|tokenomics|emission|staking|supply|coin|governance|vesting|airdrop/.test(q);
+  const isBroad = /^(?:tell\s+me\s+about|what\s+(?:is|are)|explain|describe|give\s+me\s+an?\s+overview)\b/.test(q)
+               || /ionet|io\.net|io\s+network/.test(q);
+  if (isBroad && isTokenomics) return 'broad_tokenomics';
+  if (isBroad) return 'broad_overview';
+  return 'specific_feature';
 }
 
 // ─── Background handler (all slow work lives here) ────────────────────────────
@@ -96,10 +71,13 @@ function buildFallback(chunks: Chunk[]): string {
 async function handleAskInteraction(interaction: Record<string, unknown>): Promise<void> {
   console.log('[discord] background started');
 
-  const question      = (interaction.data as any)?.options?.find((o: any) => o.name === 'question')?.value ?? '';
+  const question       = (interaction.data as any)?.options?.find((o: any) => o.name === 'question')?.value ?? '';
   const discordGuildId = String((interaction as any).guild_id ?? '');
   const userId         = String((interaction as any).member?.user?.id ?? (interaction as any).user?.id ?? 'unknown');
   const token          = String((interaction as any).token ?? '');
+
+  const intent = detectIntent(question);
+  console.log(`[/ask] question="${question}" intent=${intent}`);
 
   try {
     const chunks = await retrieveRelevantChunks(question, discordGuildId);
@@ -110,10 +88,13 @@ async function handleAskInteraction(interaction: Record<string, unknown>): Promi
     } else if (chunks.length === 0) {
       console.log('[/ask] retrieval → [] (no match or off-topic)');
     } else {
+      const sources = [...new Set(chunks.map(c => c.source_url).filter(Boolean))];
+      const titles  = [...new Set(chunks.map(c => c.title).filter(Boolean))];
+      console.log('[/ask] selected titles:', titles.join(' | ') || '(none)');
+      console.log('[/ask] selected sources:', sources.join(' | ') || '(none)');
       const top = chunks[0];
       console.log(
         '[/ask] retrieval →', chunks.length, 'chunk(s)',
-        '| source:', top.source_url ?? 'none',
         '| preview:', top.content.slice(0, 80).replace(/\n/g, ' '),
       );
     }
@@ -142,8 +123,13 @@ async function handleAskInteraction(interaction: Record<string, unknown>): Promi
       console.log('[discord] calling generateAnswer');
       const answer = await generateAnswer(question, chunks);
       console.log('[discord] generateAnswer complete');
-      if (!answer) console.log('[/ask] LLM returned null — using fallback');
-      content = answer ?? buildFallback(chunks);
+      if (answer) {
+        console.log('[/ask] answer source: LLM');
+        content = answer;
+      } else {
+        console.log('[/ask] answer source: LLM_FAILED — returning graceful error');
+        content = 'I found relevant documentation, but I could not generate a proper answer right now. Please try again in a moment.';
+      }
     }
 
     console.log('[discord] calling patchReply');

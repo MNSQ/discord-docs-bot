@@ -16,16 +16,23 @@ Return valid JSON only, with this exact structure:
 No text outside the JSON object. No code fences.
 
 WRITING THE ANSWER
-Synthesize the documentation into a clear, natural answer — do not copy-paste raw text from the context. Combine information across the provided passages into a single coherent response. Fix any awkward phrasing caused by document chunk boundaries. Write as if explaining to a knowledgeable colleague.
+Synthesize the documentation into a clear, natural answer. Combine information across ALL provided passages — do not base your answer on a single passage when several are available. Never copy-paste a raw passage verbatim. Fix any awkward phrasing from document boundaries. Write as if explaining to a knowledgeable colleague.
 
 Match answer length to the question:
 • Simple factual (yes/no, a name, a location, a single setting): 1–2 sentences.
 • "What is" or "how does" for a specific feature: a short paragraph of 3–5 sentences — what it is, why it matters, how it works.
-• Overview or "tell me about" questions: synthesize across all provided passages into 2–3 paragraphs covering what it is, what it does, who uses it, and key capabilities — include only points supported by the provided context.
+• Overview or "tell me about" questions: synthesize across ALL provided passages into 2–4 paragraphs covering what it is, what it does, who uses it, and key capabilities. Draw from every relevant passage — do not focus on one alone. Include only points supported by the provided context.
 • Steps, configuration, requirements, options, causes, or troubleshooting: one short intro sentence, then bullet points — one item per line, each starting with "•".
 • Multi-part or broad questions: up to 3 compact paragraphs, or a paragraph followed by bullets.
 
 Use bullet points when the answer naturally contains a list of separate items, steps, or options. Use a paragraph when the answer flows as continuous prose. Do not force bullets when they would break up a naturally connected explanation.
+
+HANDLING FRAGMENT PASSAGES
+Some passages may start mid-sentence (e.g., "net proposes…" when the full text is "io.net proposes…") due to how documentation was split. When you encounter such a fragment:
+• Do NOT open your answer with it.
+• Do NOT start your answer with a lowercase letter or a dangling continuation.
+• Extract only the complete, meaningful information it contains and weave it in naturally.
+• If a fragment is too broken to interpret, skip it entirely.
 
 STYLE RULES
 • Do not open with "Based on the documentation", "According to the docs", or similar filler.
@@ -40,6 +47,20 @@ STYLE RULES
 REFUSAL
 If the context does not contain enough information to answer the question, return exactly:
 {"answer": "${REFUSAL}"}`;
+
+// ─── Fragment detection ───────────────────────────────────────────────────────
+//
+// Chunks that start with a lowercase letter are continuation fragments produced
+// when the sentence splitter incorrectly broke on an abbreviation like "io.net".
+// Prefix them with "…" so the LLM sees them as mid-sentence continuations and
+// does not open its answer with the broken fragment.
+function markFragmentStarts(chunks: Chunk[]): Chunk[] {
+  return chunks.map(c => {
+    const trimmed = c.content.trimStart();
+    if (/^[a-z]/.test(trimmed)) return { ...c, content: '…' + trimmed };
+    return c;
+  });
+}
 
 // ─── Reasoning leak detection ─────────────────────────────────────────────────
 
@@ -67,7 +88,7 @@ export async function generateAnswer(
   const url       = `${BASE_URL()}/api/chat`;
   const sourceUrl = chunks[0]?.source_url ?? null;
 
-  const docText   = cleanContent(chunks.map(c => c.content).join('\n\n'));
+  const docText   = cleanContent(markFragmentStarts(chunks).map(c => c.content).join('\n\n'));
   const cappedDoc = docText.length > 5000 ? docText.slice(0, 5000) + '…' : docText;
 
   const sourceHint = sourceUrl ? `\n\nSource URL: ${sourceUrl}` : '';

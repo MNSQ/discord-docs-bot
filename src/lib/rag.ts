@@ -26,7 +26,9 @@ export function chunkText(text: string, targetSize = 1000): string[] {
   for (const para of paragraphs) {
     if (para.length > targetSize * 1.5) {
       flush();
-      const sentences = para.match(/[^.!?\n]+[.!?\n]*/g) ?? [para];
+      // Avoid breaking abbreviations like "io.net" — treat [.!?] as a sentence
+      // boundary only when it is NOT immediately followed by a non-space character.
+      const sentences = para.match(/(?:[^.!?\n]|[.!?](?=\S))+[.!?\n]*/g) ?? [para];
       for (const sentence of sentences) {
         const s = sentence.trim();
         if (!s) continue;
@@ -258,6 +260,33 @@ function isOverviewDoc(
   return SIGNALS.some(s => text.includes(s));
 }
 
+// Returns true when a document title or URL signals narrow tokenomics/staking
+// content that should be downranked for broad overview questions so the user
+// gets a platform-level answer rather than an emission schedule.
+const NARROW_DOC_SIGNALS = [
+  'tokenomics', 'token-emission', 'emission', 'staking', 'governance',
+  'coin', 'supply', 'vesting', 'unlock', 'airdrop', 'monthly',
+];
+
+function isNarrowTokenomicsDoc(
+  title: string | null | undefined,
+  sourceUrl: string | null | undefined,
+): boolean {
+  const text = `${title ?? ''} ${sourceUrl ?? ''}`.toLowerCase();
+  return NARROW_DOC_SIGNALS.some(s => text.includes(s));
+}
+
+// Returns true when the question explicitly asks about tokens or tokenomics.
+const TOKENOMICS_QUESTION_SIGNALS = [
+  'token', 'tokenomics', 'emission', 'staking', 'supply', 'coin',
+  'governance', 'vesting', 'airdrop', 'price', 'reward',
+];
+
+function isAskingAboutTokenomics(question: string): boolean {
+  const lower = question.toLowerCase();
+  return TOKENOMICS_QUESTION_SIGNALS.some(s => lower.includes(s));
+}
+
 // Picks the final context chunk set with per-document diversity and sibling
 // continuity so the LLM receives a richer, less repetitive context window.
 //   broad=true  → up to 6 chunks, max 2 per document
@@ -337,10 +366,17 @@ function rankAndSelect(
     .join(', ');
   console.log('[RAG] keywords:', kwLog || '(none after filtering)');
 
+  const askingTokenomics = isAskingAboutTokenomics(question);
+  const intent = broadQuestion
+    ? (askingTokenomics ? 'broad_tokenomics' : 'broad_overview')
+    : 'specific_feature';
+  console.log('[RAG] intent:', intent);
+
   const scored = candidates.map(c => ({
     chunk: c,
     score: scoreChunk(keywords, idf, cleanPhrase, c.content, c.title, c.source_url)
-           + (broadQuestion && isOverviewDoc(c.title, c.source_url) ? 4 : 0),
+           + (broadQuestion && isOverviewDoc(c.title, c.source_url) ? 4 : 0)
+           + (broadQuestion && !askingTokenomics && isNarrowTokenomicsDoc(c.title, c.source_url) ? -5 : 0),
   }));
   scored.sort((a, b) => b.score - a.score);
 
