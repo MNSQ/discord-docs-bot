@@ -8,45 +8,29 @@ const TIMEOUT_MS = 30_000;
 
 export const REFUSAL = 'I could not find this in the available documentation.';
 
-// ─── Prompts ──────────────────────────────────────────────────────────────────
+// ─── System prompt ────────────────────────────────────────────────────────────
+// Plain text only. Never ask the model for JSON.
 
-const SYSTEM_PROMPT = `You are the documentation assistant for a Discord server. You answer only from the provided documentation chunks.
+const SYSTEM_PROMPT = `You are a documentation assistant for a Discord server. Answer only using the provided documentation.
 
-Rules:
-- Read all provided chunks before answering.
-- Combine the useful information into one clear answer.
-- Do not copy one chunk verbatim.
-- Do not start with a broken fragment.
-- If a chunk begins mid-sentence, silently repair the flow or ignore that fragment.
-- If the question is broad, give a broad explanation using all relevant chunks.
-- If the question is specific, answer directly.
-- If the docs do not contain the answer, say: "${REFUSAL}"
-- Do not invent facts outside the docs.
-- Do not mention chunks, retrieval, context, or internal processing.
-- Do not include source URLs in the answer; the app adds sources separately.
-- Output only the final answer.`;
+Read all provided documentation sections, combine the useful information, and write the best possible answer.
 
-function buildUserMessage(question: string, chunks: Chunk[]): string {
-  const blocks = markFragmentStarts(chunks)
-    .map((c, i) => {
-      const title  = c.title     ?? 'Untitled';
-      const source = c.source_url ?? 'unknown';
-      return `[${i + 1}] Title: ${title}\nSource: ${source}\nContent:\n${c.content}`;
-    })
-    .join('\n\n');
+Do not copy one section verbatim.
+Do not mention chunks, retrieval, context, or internal processing.
+Do not include source URLs because the app adds sources separately.
+If the documentation does not contain the answer, say: "${REFUSAL}"
 
-  const capped = blocks.length > 5000 ? blocks.slice(0, 5000) + '\n…' : blocks;
+For broad questions like "tell me about io.net" or "what is io.net", write 1–3 useful paragraphs.
+For setup/configuration questions, use clear steps.
+For specific questions, answer directly.
 
-  return [
-    `Question:\n${question}`,
-    `Documentation:\n${capped}`,
-    'Now write the best possible answer using only the documentation above.',
-    'Answer style:\n- For "tell me about X", "what is X", or "explain X": write 1–3 solid paragraphs.\n- For setup/configuration questions: use clear steps.\n- For comparisons or lists: use bullets.\n- Keep the answer concise but useful.\n- Prefer natural explanation over raw documentation wording.',
-  ].join('\n\n');
-}
+Return only the final plain text answer. No JSON.`;
 
 // ─── Fragment detection ───────────────────────────────────────────────────────
 
+// Chunks starting with a lowercase letter are mid-sentence continuation
+// fragments (e.g. "net proposes..." from a split across "io.net"). Mark them
+// so the model knows not to open the answer with a broken fragment.
 function markFragmentStarts(chunks: Chunk[]): Chunk[] {
   return chunks.map(c => {
     const trimmed = c.content.trimStart();
@@ -55,83 +39,43 @@ function markFragmentStarts(chunks: Chunk[]): Chunk[] {
   });
 }
 
-// ─── Answer extraction ────────────────────────────────────────────────────────
+// ─── User message ─────────────────────────────────────────────────────────────
 
-// Strips <think>...</think> blocks that Qwen3 can produce when thinking bleeds through.
-function stripThinkingBlocks(text: string): string {
-  return text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+function buildUserMessage(question: string, chunks: Chunk[]): string {
+  const sections = markFragmentStarts(chunks).map((c, i) => {
+    const title  = c.title      ?? 'Untitled';
+    const source = c.source_url ?? 'unknown';
+    return `[${i + 1}] Title: ${title}\nSource: ${source}\nContent:\n${c.content}`;
+  });
+  const docs   = sections.join('\n\n');
+  const capped = docs.length > 5000 ? docs.slice(0, 5000) + '\n…' : docs;
+
+  return `Question:\n${question}\n\nDocumentation:\n${capped}\n\nNow write the best possible answer.`;
 }
 
-// Tolerant extraction: prefers JSON (any key), falls back to plain text.
-function extractAnswer(raw: string): string {
-  // 1. Strip thinking blocks
-  let text = stripThinkingBlocks(raw);
+// ─── Answer cleaning ──────────────────────────────────────────────────────────
 
-  // 2. Strip Markdown code fences
-  text = text
-    .replace(/^```(?:json)?\s*/i, '')
-    .replace(/\s*```\s*$/i, '')
-    .trim();
-
-  // 3. Try to parse as JSON
-  try {
-    const parsed = JSON.parse(text) as Record<string, unknown>;
-    for (const key of ['answer', 'content', 'message', 'response', 'text', 'result']) {
-      const val = parsed[key];
-      if (typeof val === 'string' && val.trim()) return val.trim();
-    }
-    // Parsed but no recognised key — fall through to plain text
-  } catch {
-    // Not JSON
-  }
-
-  // 4. Try to extract embedded JSON object containing a known key
-  const embedded = text.match(/\{[\s\S]*?"(?:answer|content|response|text)"[\s\S]*?\}/);
-  if (embedded) {
-    try {
-      const parsed = JSON.parse(embedded[0]) as Record<string, unknown>;
-      for (const key of ['answer', 'content', 'response', 'text']) {
-        const val = parsed[key];
-        if (typeof val === 'string' && val.trim()) return val.trim();
-      }
-    } catch {
-      // Ignore
-    }
-  }
-
-  // 5. Plain text — strip any "Answer:" prefix the model may have added
-  text = text.replace(/^(?:final\s+)?answer\s*[:：]\s*/i, '').trim();
-
-  return text;
-}
-
-// ─── Rejection checks ─────────────────────────────────────────────────────────
-
-// Rejects only for genuine failures — empty output, un-stripped thinking tags,
-// or an explicit "Reasoning:" bleed-through. Does NOT reject for minor formatting.
-function isRejectable(answer: string): { reject: boolean; reason: string } {
-  if (!answer) {
-    return { reject: true, reason: 'empty answer' };
-  }
-  if (/<think>/i.test(answer)) {
-    return { reject: true, reason: 'contains un-stripped <think> tag' };
-  }
-  if (/^Reasoning\s*:/im.test(answer)) {
-    return { reject: true, reason: 'starts with Reasoning: bleed-through' };
-  }
-  return { reject: false, reason: '' };
+function cleanAnswer(raw: string): string {
+  let t = raw;
+  // Strip <think>...</think> blocks Qwen3 may emit
+  t = t.replace(/<think>[\s\S]*?<\/think>/gi, '');
+  // Strip Markdown code fences
+  t = t.replace(/^```[\w]*\s*/i, '').replace(/\s*```\s*$/i, '');
+  // Strip leading "Answer:" prefix the model may add
+  t = t.replace(/^(?:final\s+)?answer\s*[:：]\s*/i, '');
+  return t.trim();
 }
 
 // ─── Main export ──────────────────────────────────────────────────────────────
+// Throws an Error with a clear reason on every failure path — never returns null.
 
 export async function generateAnswer(
   question: string,
   chunks: Chunk[],
-): Promise<string | null> {
-  const model     = MODEL();
-  const baseUrl   = BASE_URL();
-  const url       = `${baseUrl}/api/chat`;
-  const sourceUrl = chunks[0]?.source_url ?? null;
+): Promise<string> {
+  const model   = MODEL();
+  const baseUrl = BASE_URL();
+  const url     = `${baseUrl}/api/chat`;
 
   const hostname = (() => {
     try { return new URL(baseUrl).hostname; } catch { return baseUrl; }
@@ -140,28 +84,27 @@ export async function generateAnswer(
   console.log('[LLM] request started');
   console.log('[LLM] gateway:', hostname);
   console.log('[LLM] model:', model);
-  console.log('[LLM] chunks:', chunks.length, '| best source:', sourceUrl ?? 'none');
 
-  const startMs = Date.now();
+  const startMs   = Date.now();
+  const secret    = GATEWAY_SECRET();
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (secret) headers['Authorization'] = `Bearer ${secret}`;
 
+  const controller = new AbortController();
+  const timer      = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+  // ── HTTP request ───────────────────────────────────────────────────────────
+  let res: Response;
   try {
-    const secret  = GATEWAY_SECRET();
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (secret) headers['Authorization'] = `Bearer ${secret}`;
-
-    const controller = new AbortController();
-    const timer      = setTimeout(() => controller.abort(), TIMEOUT_MS);
-
-    const res = await fetch(url, {
+    res = await fetch(url, {
       method:  'POST',
       headers,
       signal:  controller.signal,
       body: JSON.stringify({
         model,
-        stream:  false,
-        think:   false,
-        // No format: "json" — plain text output is more reliable than constrained
-        // JSON decoding when the model may pick a different key or emit preamble.
+        stream: false,
+        think:  false,
+        // No format:"json" — plain text output only.
         options: {
           temperature: 0.1,
           num_predict: 1200,
@@ -173,62 +116,90 @@ export async function generateAnswer(
         ],
       }),
     });
-
-    clearTimeout(timer);
-    const durationMs = Date.now() - startMs;
-
-    if (!res.ok) {
-      const body = await res.text();
-      console.error(`[LLM] request failed with error: HTTP ${res.status} — ${body}`);
-      return null;
-    }
-
-    const data = await res.json() as {
-      message?: { content?: string; thinking?: string };
-    };
-
-    const raw = (data?.message?.content ?? '').trim();
-    console.log('[LLM] raw response length:', raw.length);
-
-    if (!raw) {
-      console.error('[LLM] request failed with error: empty content from model');
-      return null;
-    }
-
-    const answer = extractAnswer(raw);
-    console.log('[LLM] parsed answer length:', answer.length);
-
-    const { reject, reason } = isRejectable(answer);
-    if (reject) {
-      console.warn('[LLM] parse failed with error: rejected —', reason);
-      return null;
-    }
-
-    // Return refusal as-is (no source link appended)
-    if (answer.includes(REFUSAL)) {
-      console.log(`[LLM] refusal | ${durationMs}ms`);
-      return REFUSAL;
-    }
-
-    // Append best source URL if not already present
-    let final = answer;
-    if (sourceUrl && !answer.includes(sourceUrl)) {
-      final = `${answer}\n\nFor more information, check: ${sourceUrl}`;
-    }
-
-    // Discord hard limit
-    if (final.length > 1900) final = final.slice(0, 1897) + '…';
-
-    console.log(`[LLM] success | ${durationMs}ms | ${final.length} chars`);
-    return final;
-
   } catch (err) {
-    const durationMs = Date.now() - startMs;
-    if (err instanceof Error && err.name === 'AbortError') {
-      console.error(`[LLM] request failed with error: timed out after ${TIMEOUT_MS / 1000}s (${durationMs}ms)`);
-    } else {
-      console.error(`[LLM] request failed with error (${durationMs}ms):`, err);
-    }
-    return null;
+    clearTimeout(timer);
+    const ms     = Date.now() - startMs;
+    const reason = err instanceof Error
+      ? (err.name === 'AbortError' ? `timed out after ${TIMEOUT_MS / 1000}s` : err.message)
+      : String(err);
+    throw new Error(`[LLM] full error message: fetch failed — ${reason} (${ms}ms)`);
   }
+  clearTimeout(timer);
+
+  const durationMs = Date.now() - startMs;
+  console.log('[LLM] HTTP status:', res.status);
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '(unreadable body)');
+    throw new Error(`[LLM] full error message: HTTP ${res.status} from gateway — ${body}`);
+  }
+
+  // ── Parse gateway JSON envelope ────────────────────────────────────────────
+  let data: Record<string, unknown>;
+  try {
+    data = (await res.json()) as Record<string, unknown>;
+  } catch (err) {
+    throw new Error(`[LLM] full error message: could not parse gateway response as JSON — ${err}`);
+  }
+
+  console.log('[LLM] raw response keys:', Object.keys(data).join(', '));
+
+  // ── Extract model text ─────────────────────────────────────────────────────
+  // Ollama /api/chat → data.message.content
+  // Ollama /api/generate → data.response
+  // Fallback: look for any top-level string value
+  const msg = data.message;
+  const rawFromChat =
+    msg !== null && typeof msg === 'object'
+      ? ((msg as Record<string, unknown>).content ?? '')
+      : '';
+
+  const rawText =
+    typeof rawFromChat === 'string' && rawFromChat.trim()
+      ? rawFromChat
+      : typeof data.response === 'string' && (data.response as string).trim()
+      ? (data.response as string)
+      : '';
+
+  console.log('[LLM] raw content length:', rawText.length);
+
+  if (!rawText.trim()) {
+    throw new Error(
+      '[LLM] full error message: model returned empty content — ' +
+      `message.content="${String(rawFromChat)}" | response="${String(data.response ?? '')}"`,
+    );
+  }
+
+  // ── Clean the answer ───────────────────────────────────────────────────────
+  const answer = cleanAnswer(rawText);
+  console.log('[LLM] cleaned answer length:', answer.length);
+
+  if (!answer) {
+    throw new Error('[LLM] rejection reason: cleaned answer is empty after stripping');
+  }
+  if (/<think>/i.test(answer)) {
+    throw new Error('[LLM] rejection reason: answer still contains <think> tag after stripping');
+  }
+  if (/^Reasoning\s*:/im.test(answer)) {
+    throw new Error('[LLM] rejection reason: answer begins with "Reasoning:" bleed-through');
+  }
+
+  // ── Refusal ────────────────────────────────────────────────────────────────
+  if (answer.includes(REFUSAL)) {
+    console.log(`[LLM] refusal | ${durationMs}ms`);
+    return REFUSAL;
+  }
+
+  // ── Append source URL ──────────────────────────────────────────────────────
+  const sourceUrl = chunks[0]?.source_url ?? null;
+  let final = answer;
+  if (sourceUrl && !answer.includes(sourceUrl)) {
+    final = `${answer}\n\nFor more information, check: ${sourceUrl}`;
+  }
+
+  // Discord 2000-char hard limit with headroom
+  if (final.length > 1900) final = final.slice(0, 1897) + '…';
+
+  console.log(`[LLM] success | ${durationMs}ms | ${final.length} chars`);
+  return final;
 }
