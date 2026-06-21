@@ -9,6 +9,13 @@ export interface Chunk {
   title?: string | null;
 }
 
+// Carries both the selected chunks AND the URL of the highest-scoring chunk
+// (tracked before any reading-order re-sort so the source link is always correct).
+export interface RetrievalResult {
+  chunks: Chunk[];
+  bestSource: string | null;
+}
+
 // ─── Chunking ────────────────────────────────────────────────────────────────
 
 export function chunkText(text: string, targetSize = 1000): string[] {
@@ -287,6 +294,75 @@ function isAskingAboutTokenomics(question: string): boolean {
   return TOKENOMICS_QUESTION_SIGNALS.some(s => lower.includes(s));
 }
 
+// ─── Install / VM doc + intent detection ─────────────────────────────────────
+
+const INSTALL_DOC_SIGNALS = [
+  'install', 'ubuntu', 'hiveos', 'hive-os', 'nvidia', 'amd-gpu',
+  'worker-setup', 'setup-worker', 'run-worker', 'install-worker',
+  'install-on', 'getting-started/worker', 'getting-started/supplier',
+];
+
+function isInstallDoc(
+  title: string | null | undefined,
+  sourceUrl: string | null | undefined,
+): boolean {
+  const text = `${title ?? ''} ${sourceUrl ?? ''}`.toLowerCase();
+  return INSTALL_DOC_SIGNALS.some(s => text.includes(s));
+}
+
+const VM_DOC_SIGNALS = [
+  'deploy-vm', 'deploy_vm', 'virtual-machine', 'on-demand', 'cloud-compute',
+  'vm-on-demand', '/vm', 'cloud-vm',
+];
+
+function isVmDoc(
+  title: string | null | undefined,
+  sourceUrl: string | null | undefined,
+): boolean {
+  const text = `${title ?? ''} ${sourceUrl ?? ''}`.toLowerCase();
+  return VM_DOC_SIGNALS.some(s => text.includes(s));
+}
+
+const VM_QUESTION_SIGNALS = [
+  ' vm', 'virtual machine', 'on demand', 'on-demand', 'cloud vm',
+  'deploy vm', 'spin up', 'cloud instance',
+];
+
+function isAskingAboutVm(question: string): boolean {
+  const lower = question.toLowerCase();
+  return VM_QUESTION_SIGNALS.some(s => lower.includes(s));
+}
+
+const INSTALL_QUESTION_SIGNALS = [
+  'install', 'setup', 'set up', 'configure', 'worker setup', 'ubuntu',
+  'hiveos', 'nvidia', 'amd gpu', 'gpu driver', 'run worker', 'add worker',
+];
+
+function isAskingAboutInstall(question: string): boolean {
+  const lower = question.toLowerCase();
+  return INSTALL_QUESTION_SIGNALS.some(s => lower.includes(s));
+}
+
+// Returns true when a chunk is predominantly shell commands / code blocks.
+// These are less useful to the LLM for non-install questions.
+function isCommandHeavyChunk(content: string): boolean {
+  const lines = content.split('\n').filter(l => l.trim().length > 0);
+  if (lines.length < 3) return false;
+  const cmdCount = lines.filter(l => {
+    const t = l.trim();
+    return (
+      t.startsWith('$ ')     || t.startsWith('#!')    ||
+      t.startsWith('curl ')  || t.startsWith('wget ')  ||
+      t.startsWith('apt ')   || t.startsWith('apt-get ') ||
+      t.startsWith('sudo ')  || t.startsWith('bash ')  ||
+      t.startsWith('pip ')   || t.startsWith('npm ')   ||
+      t.startsWith('yarn ')  || t.startsWith('docker ') ||
+      /^```/.test(t)         || /^[A-Z_]{3,}=/.test(t)
+    );
+  }).length;
+  return cmdCount > lines.length * 0.3;
+}
+
 // Picks the final context chunk set with per-document diversity and sibling
 // continuity so the LLM receives a richer, less repetitive context window.
 //   broad=true  → up to 6 chunks, max 2 per document
@@ -367,30 +443,51 @@ function rankAndSelect(
   console.log('[RAG] keywords:', kwLog || '(none after filtering)');
 
   const askingTokenomics = isAskingAboutTokenomics(question);
+  const askingVm         = isAskingAboutVm(question);
+  const askingInstall    = isAskingAboutInstall(question);
+
   const intent = broadQuestion
     ? (askingTokenomics ? 'broad_tokenomics' : 'broad_overview')
+    : askingVm         ? 'vm_query'
+    : askingInstall    ? 'install_query'
+    : askingTokenomics ? 'tokenomics_query'
     : 'specific_feature';
   console.log('[RAG] intent:', intent);
 
-  const scored = candidates.map(c => ({
-    chunk: c,
-    score: scoreChunk(keywords, idf, cleanPhrase, c.content, c.title, c.source_url)
-           + (broadQuestion && isOverviewDoc(c.title, c.source_url) ? 4 : 0)
-           + (broadQuestion && !askingTokenomics && isNarrowTokenomicsDoc(c.title, c.source_url) ? -5 : 0),
-  }));
+  const scored = candidates.map(c => {
+    let score = scoreChunk(keywords, idf, cleanPhrase, c.content, c.title, c.source_url);
+
+    // Overview boost for broad questions
+    if (broadQuestion && isOverviewDoc(c.title, c.source_url)) score += 4;
+
+    // Tokenomics: downrank for broad non-tokenomics; strongly boost for tokenomics queries
+    if (broadQuestion && !askingTokenomics && isNarrowTokenomicsDoc(c.title, c.source_url)) score -= 5;
+    if (askingTokenomics && isNarrowTokenomicsDoc(c.title, c.source_url)) score += 6;
+
+    // VM: strongly boost VM/deploy docs for VM queries
+    if (askingVm && isVmDoc(c.title, c.source_url)) score += 6;
+
+    // Install docs: heavily downrank unless the user is asking about installation
+    if (!askingInstall && isInstallDoc(c.title, c.source_url)) score -= 6;
+
+    // Command-heavy chunks: downrank for non-install, non-VM questions
+    if (!askingInstall && !askingVm && isCommandHeavyChunk(c.content)) score -= 3;
+
+    return { chunk: c, score };
+  });
   scored.sort((a, b) => b.score - a.score);
 
-  console.log('[RAG] top 5:');
-  scored.slice(0, 5).forEach((s, rank) => {
-    const preview  = s.chunk.content.slice(0, 50).replace(/\n/g, ' ');
-    const urlTail  = s.chunk.source_url
+  console.log('[RAG] top 10 ranked:');
+  scored.slice(0, 10).forEach((s, rank) => {
+    const preview = s.chunk.content.slice(0, 60).replace(/\n/g, ' ');
+    const urlTail = s.chunk.source_url
       ? '…/' + s.chunk.source_url.split('/').slice(-2).join('/')
       : 'no-url';
     console.log(
       `  #${rank + 1} score=${s.score.toFixed(2)}`,
       `| title="${s.chunk.title ?? 'n/a'}"`,
       `| ${urlTail}`,
-      `| ${preview}`,
+      `| "${preview}"`,
     );
   });
 
@@ -521,7 +618,7 @@ const MAX_CANDIDATE_CHUNKS = 1000;
 export async function retrieveRelevantChunks(
   question: string,
   discordGuildId: string,
-): Promise<Chunk[] | null> {
+): Promise<RetrievalResult | null> {
   console.log('[RAG] ── retrieve ──────────────────────────');
   console.log('[RAG] discordGuildId:', discordGuildId);
   console.log('[RAG] question:', question);
@@ -645,7 +742,7 @@ export async function retrieveRelevantChunks(
   const questionKeywords = extractKeywords(expandQuery(question));
   if (questionKeywords.length === 0) {
     console.log('[RAG] rejected — no meaningful domain keywords (off-topic question)');
-    return [];
+    return { chunks: [], bestSource: null };
   }
   console.log('[RAG] meaningful keywords:', questionKeywords.join(', '));
 
@@ -675,10 +772,12 @@ export async function retrieveRelevantChunks(
       );
       if (topicCandidates.length > 0) {
         const { chunks: topicChunks } = rankAndSelect(topicCandidates, question, broadQuestion);
-        // Restore natural reading order after scoring
+        // Record the best source BEFORE re-sorting into reading order.
+        // chunks[0] here is the highest-scoring chunk; after chunk_index sort it may not be first.
+        const bestSource = topicChunks[0]?.source_url ?? null;
         topicChunks.sort((a, b) => (a.chunk_index ?? 0) - (b.chunk_index ?? 0));
-        console.log('[RAG] topic routing → returning', topicChunks.length, 'chunk(s) from matched document');
-        return topicChunks;
+        console.log('[RAG] topic routing → returning', topicChunks.length, 'chunk(s) | best source:', bestSource ?? 'none');
+        return { chunks: topicChunks, bestSource };
       }
     } else {
       console.log('[RAG] topic detected but no document title/URL matched — using IDF scoring');
@@ -690,7 +789,7 @@ export async function retrieveRelevantChunks(
 
   if (bestScore < MIN_SCORE) {
     console.log(`[RAG] score ${bestScore.toFixed(2)} below threshold ${MIN_SCORE} — no match`);
-    return [];
+    return { chunks: [], bestSource: null };
   }
 
   // ── 9. Policy / refusal chunk guard ──────────────────────────────────────
@@ -700,18 +799,17 @@ export async function retrieveRelevantChunks(
       console.log('[RAG] top chunk is policy — question IS about policy → returning it');
     } else {
       console.log('[RAG] top chunk is policy/refusal — rejecting (off-topic question)');
-      return [];
+      return { chunks: [], bestSource: null };
     }
   }
 
+  const bestSource = chunks[0]?.source_url ?? null;
   console.log(
     '[RAG] ✓ selected', chunks.length, 'chunk(s)',
     '| score:', bestScore.toFixed(2),
-    '| idx:', chunks[0].chunk_index,
-    '| title:', chunks[0].title ?? 'n/a',
-    '| source_url:', chunks[0].source_url ?? 'none',
+    '| best source:', bestSource ?? 'none',
     '\n[RAG] preview:', chunks[0].content.slice(0, 100).replace(/\n/g, ' '),
   );
 
-  return chunks;
+  return { chunks, bestSource };
 }

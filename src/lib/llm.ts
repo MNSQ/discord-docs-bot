@@ -9,28 +9,28 @@ const TIMEOUT_MS = 30_000;
 export const REFUSAL = 'I could not find this in the available documentation.';
 
 // ─── System prompt ────────────────────────────────────────────────────────────
-// Plain text only. Never ask the model for JSON.
 
-const SYSTEM_PROMPT = `You are a documentation assistant for a Discord server. Answer only using the provided documentation.
+const SYSTEM_PROMPT = `You are a Discord documentation assistant. Answer only from the provided documentation.
 
-Read all provided documentation sections, combine the useful information, and write the best possible answer.
+Write the final answer directly. Do not show your analysis. Do not mention sections, chunks, retrieved documents, context, or internal reasoning.
 
-Do not copy one section verbatim.
-Do not mention chunks, retrieval, context, or internal processing.
-Do not include source URLs because the app adds sources separately.
+Do not say "Let me analyze", "Looking through the documentation", "Section [1]", "From section", "Based on section", "The most relevant section", or similar.
+
+Silently treat "ionet", "io net", "IONET", and "IO.NET" as the same project. Use "io.net" as the canonical name in the answer.
+
 If the documentation does not contain the answer, say: "${REFUSAL}"
 
 For broad questions like "tell me about io.net" or "what is io.net", write 1–3 useful paragraphs.
-For setup/configuration questions, use clear steps.
-For specific questions, answer directly.
+For setup or configuration questions, use clear steps.
+For specific questions, answer directly and concisely.
 
-Return only the final plain text answer. No JSON.`;
+Return only the final plain text answer. No JSON. No section analysis.`;
 
 // ─── Fragment detection ───────────────────────────────────────────────────────
 
 // Chunks starting with a lowercase letter are mid-sentence continuation
-// fragments (e.g. "net proposes..." from a split across "io.net"). Mark them
-// so the model knows not to open the answer with a broken fragment.
+// fragments from a split across an abbreviation like "io.net". Mark them so
+// the model does not open its answer with a broken fragment.
 function markFragmentStarts(chunks: Chunk[]): Chunk[] {
   return chunks.map(c => {
     const trimmed = c.content.trimStart();
@@ -41,52 +41,96 @@ function markFragmentStarts(chunks: Chunk[]): Chunk[] {
 
 // ─── User message ─────────────────────────────────────────────────────────────
 
-function buildUserMessage(question: string, chunks: Chunk[]): string {
-  const sections = markFragmentStarts(chunks).map((c, i) => {
-    const title  = c.title      ?? 'Untitled';
-    const source = c.source_url ?? 'unknown';
-    return `[${i + 1}] Title: ${title}\nSource: ${source}\nContent:\n${c.content}`;
-  });
-  const docs   = sections.join('\n\n');
-  const capped = docs.length > 5000 ? docs.slice(0, 5000) + '\n…' : docs;
+const MAX_CHUNK_CHARS = 1000;
+const MAX_CHUNKS      = 5;
 
-  return `Question:\n${question}\n\nDocumentation:\n${capped}\n\nNow write the best possible answer.`;
+function buildUserMessage(question: string, chunks: Chunk[]): string {
+  const sections = markFragmentStarts(chunks.slice(0, MAX_CHUNKS)).map((c, i) => {
+    const title   = c.title      ?? 'Untitled';
+    const source  = c.source_url ?? 'unknown';
+    const content = c.content.length > MAX_CHUNK_CHARS
+      ? c.content.slice(0, MAX_CHUNK_CHARS) + '…'
+      : c.content;
+    return `[${i + 1}] Title: ${title}\nSource: ${source}\nContent:\n${content}`;
+  });
+
+  const promptChars = sections.reduce((n, s) => n + s.length, 0);
+  console.log('[LLM] prompt doc chars:', promptChars, '| chunks used:', sections.length);
+
+  return [
+    `Question:\n${question}`,
+    `Documentation:\n${sections.join('\n\n')}`,
+    'Write only the final answer. Do not include analysis or reasoning. Do not mention documentation section numbers.',
+  ].join('\n\n');
 }
 
-// ─── Answer cleaning ──────────────────────────────────────────────────────────
+// ─── Cleaning ─────────────────────────────────────────────────────────────────
 
-function cleanAnswer(raw: string): string {
+export function cleanAnswer(raw: string): string {
   let t = raw ?? '';
 
-  // Step 1: If the output contains </think>, discard everything before (and
-  // including) the LAST occurrence. This handles the case where Qwen3 emits a
-  // reasoning prefix that ends with </think> but the <think> opener was never
-  // sent — the whole prefix up to the final closer is reasoning noise.
+  // Step 1: discard everything before the last </think> (Qwen3 reasoning prefix)
   const lastClose = t.lastIndexOf('</think>');
-  const strippedThinkPrefix = lastClose !== -1;
-  if (strippedThinkPrefix) {
-    t = t.slice(lastClose + '</think>'.length);
-  }
-  console.log('[LLM] stripped thinking prefix:', strippedThinkPrefix);
+  const strippedThink = lastClose !== -1;
+  if (strippedThink) t = t.slice(lastClose + '</think>'.length);
+  console.log('[LLM] stripped thinking prefix:', strippedThink);
 
-  // Step 2: Remove any complete <think>...</think> blocks that remain
+  // Step 2: remove any remaining paired <think>...</think> blocks
   t = t.replace(/<think>[\s\S]*?<\/think>/gi, '');
 
-  // Step 3: Unwrap Markdown code fences (keep inner content)
+  // Step 3: unwrap Markdown code fences (keep inner text)
   t = t.replace(/```(?:\w+)?\s*([\s\S]*?)```/g, '$1');
 
-  // Step 4: Strip leading "Answer:" prefix the model may add
+  // Step 4: strip leading "Answer:" prefix the model may add
   t = t.replace(/^(?:final\s+)?answer\s*[:：]\s*/i, '');
 
   return t.trim();
 }
 
+// ─── Untagged reasoning sanitiser ────────────────────────────────────────────
+
+const REASONING_PREFIXES = [
+  'let me analyze',
+  'i need to analyze',
+  'looking through',
+  'the question is asking',
+  'i should',
+  "i'll craft",
+  'section [',
+  'from section',
+  'the most relevant section',
+  'based on the documentation sections',
+  'based on the provided documentation sections',
+];
+
+function isReasoningParagraph(para: string): boolean {
+  const lower = para.trim().toLowerCase();
+  return REASONING_PREFIXES.some(p => lower.startsWith(p));
+}
+
+export function sanitizeFinalAnswer(text: string): string {
+  const paragraphs = text.split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
+
+  if (paragraphs.length === 0 || !isReasoningParagraph(paragraphs[0])) {
+    return text; // no leak detected — pass through unchanged
+  }
+
+  const clean = paragraphs.filter(p => !isReasoningParagraph(p));
+  if (clean.length === 0) {
+    throw new Error('[LLM] rejection reason: reasoning leak without clean final answer');
+  }
+
+  console.log('[LLM] sanitized reasoning leak: stripped', paragraphs.length - clean.length, 'paragraph(s)');
+  return clean.join('\n\n');
+}
+
 // ─── Main export ──────────────────────────────────────────────────────────────
-// Throws an Error with a clear reason on every failure path — never returns null.
+// Throws an Error with a clear reason on every failure — never returns null.
 
 export async function generateAnswer(
   question: string,
   chunks: Chunk[],
+  bestSource: string | null,
 ): Promise<string> {
   const model   = MODEL();
   const baseUrl = BASE_URL();
@@ -99,9 +143,10 @@ export async function generateAnswer(
   console.log('[LLM] request started');
   console.log('[LLM] gateway:', hostname);
   console.log('[LLM] model:', model);
+  console.log('[LLM] chunks:', chunks.length, '| best source:', bestSource ?? 'none');
 
-  const startMs   = Date.now();
-  const secret    = GATEWAY_SECRET();
+  const startMs = Date.now();
+  const secret  = GATEWAY_SECRET();
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (secret) headers['Authorization'] = `Bearer ${secret}`;
 
@@ -120,11 +165,7 @@ export async function generateAnswer(
         stream: false,
         think:  false,
         // No format:"json" — plain text output only.
-        options: {
-          temperature: 0.1,
-          num_predict: 1200,
-          num_ctx:     8192,
-        },
+        options: { temperature: 0.1, num_predict: 1200, num_ctx: 8192 },
         messages: [
           { role: 'system', content: SYSTEM_PROMPT },
           { role: 'user',   content: buildUserMessage(question, chunks) },
@@ -149,7 +190,7 @@ export async function generateAnswer(
     throw new Error(`[LLM] full error message: HTTP ${res.status} from gateway — ${body}`);
   }
 
-  // ── Parse gateway JSON envelope ────────────────────────────────────────────
+  // ── Parse gateway envelope ─────────────────────────────────────────────────
   let data: Record<string, unknown>;
   try {
     data = (await res.json()) as Record<string, unknown>;
@@ -159,19 +200,15 @@ export async function generateAnswer(
 
   console.log('[LLM] raw response keys:', Object.keys(data).join(', '));
 
-  // ── Extract model text ─────────────────────────────────────────────────────
-  // Ollama /api/chat → data.message.content
-  // Ollama /api/generate → data.response
-  // Fallback: look for any top-level string value
-  const msg = data.message;
-  const rawFromChat =
+  const msg        = data.message;
+  const chatContent =
     msg !== null && typeof msg === 'object'
       ? ((msg as Record<string, unknown>).content ?? '')
       : '';
 
   const rawText =
-    typeof rawFromChat === 'string' && rawFromChat.trim()
-      ? rawFromChat
+    typeof chatContent === 'string' && chatContent.trim()
+      ? chatContent
       : typeof data.response === 'string' && (data.response as string).trim()
       ? (data.response as string)
       : '';
@@ -181,23 +218,26 @@ export async function generateAnswer(
   if (!rawText.trim()) {
     throw new Error(
       '[LLM] full error message: model returned empty content — ' +
-      `message.content="${String(rawFromChat)}" | response="${String(data.response ?? '')}"`,
+      `message.content="${String(chatContent)}" | response="${String(data.response ?? '')}"`,
     );
   }
 
-  // ── Clean the answer ───────────────────────────────────────────────────────
-  const answer = cleanAnswer(rawText);
-  console.log('[LLM] cleaned answer length:', answer.length);
+  // ── Clean ──────────────────────────────────────────────────────────────────
+  const cleaned = cleanAnswer(rawText);
+  console.log('[LLM] cleaned answer length:', cleaned.length);
 
-  if (!answer.trim()) {
+  if (!cleaned.trim()) {
     throw new Error('[LLM] rejection reason: cleaned answer is empty after stripping');
   }
-  if (/<\/?think\b/i.test(answer)) {
+  if (/<\/?think\b/i.test(cleaned)) {
     throw new Error('[LLM] rejection reason: residual thinking tag after cleaning');
   }
-  if (/^Reasoning\s*:/im.test(answer)) {
+  if (/^Reasoning\s*:/im.test(cleaned)) {
     throw new Error('[LLM] rejection reason: answer begins with "Reasoning:" bleed-through');
   }
+
+  // ── Sanitise untagged reasoning ────────────────────────────────────────────
+  const answer = sanitizeFinalAnswer(cleaned);
 
   // ── Refusal ────────────────────────────────────────────────────────────────
   if (answer.includes(REFUSAL)) {
@@ -205,14 +245,13 @@ export async function generateAnswer(
     return REFUSAL;
   }
 
-  // ── Append source URL ──────────────────────────────────────────────────────
-  const sourceUrl = chunks[0]?.source_url ?? null;
+  // ── Append best source URL ─────────────────────────────────────────────────
   let final = answer;
-  if (sourceUrl && !answer.includes(sourceUrl)) {
-    final = `${answer}\n\nFor more information, check: ${sourceUrl}`;
+  if (bestSource && !answer.includes(bestSource)) {
+    final = `${answer}\n\nFor more information, check: ${bestSource}`;
   }
 
-  // Discord 2000-char hard limit with headroom
+  // Discord hard limit
   if (final.length > 1900) final = final.slice(0, 1897) + '…';
 
   console.log(`[LLM] success | ${durationMs}ms | ${final.length} chars`);

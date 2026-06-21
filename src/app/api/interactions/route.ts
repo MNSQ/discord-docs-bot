@@ -83,31 +83,29 @@ async function handleAskInteraction(interaction: Record<string, unknown>): Promi
   console.log(`[/ask] question="${question}" intent=${intent}`);
 
   try {
-    const chunks = await retrieveRelevantChunks(question, discordGuildId);
+    const result = await retrieveRelevantChunks(question, discordGuildId);
     console.log('[discord] retrieve complete');
 
-    if (chunks === null) {
+    if (result === null) {
       console.log('[/ask] retrieval → null (no docs for this guild)');
-    } else if (chunks.length === 0) {
+    } else if (result.chunks.length === 0) {
       console.log('[/ask] retrieval → [] (no match or off-topic)');
     } else {
-      const sources = [...new Set(chunks.map(c => c.source_url).filter(Boolean))];
-      const titles  = [...new Set(chunks.map(c => c.title).filter(Boolean))];
+      const titles  = [...new Set(result.chunks.map(c => c.title).filter(Boolean))];
       console.log('[/ask] selected titles:', titles.join(' | ') || '(none)');
-      console.log('[/ask] selected sources:', sources.join(' | ') || '(none)');
-      const top = chunks[0];
+      console.log('[/ask] best source:', result.bestSource ?? '(none)');
       console.log(
-        '[/ask] retrieval →', chunks.length, 'chunk(s)',
-        '| preview:', top.content.slice(0, 80).replace(/\n/g, ' '),
+        '[/ask] retrieval →', result.chunks.length, 'chunk(s)',
+        '| preview:', result.chunks[0].content.slice(0, 80).replace(/\n/g, ' '),
       );
     }
 
-    const answered = chunks !== null && chunks.length > 0;
+    const answered = result !== null && result.chunks.length > 0;
     logUsage({ discordGuildId, userId, question, answered });
 
     let content: string;
 
-    if (chunks === null) {
+    if (result === null) {
       const appUrl = (process.env.NEXT_PUBLIC_APP_URL ?? '').replace(/\/$/, '');
       const dashboardUrl = appUrl
         ? `${appUrl}/dashboard?guild_id=${encodeURIComponent(discordGuildId)}`
@@ -120,20 +118,20 @@ async function handleAskInteraction(interaction: Record<string, unknown>): Promi
       ];
       if (dashboardUrl) lines.push('', `Dashboard: ${dashboardUrl}`);
       content = lines.join('\n');
-    } else if (chunks.length === 0) {
+    } else if (result.chunks.length === 0) {
       content = REFUSAL;
     } else {
       console.log('[discord] calling generateAnswer');
       try {
-        content = await generateAnswer(question, chunks);
+        content = await generateAnswer(question, result.chunks, result.bestSource);
         console.log('[discord] generateAnswer complete');
         console.log('[/ask] answer source: LLM');
       } catch (llmErr) {
         const msg = llmErr instanceof Error ? llmErr.message : String(llmErr);
         console.error('[/ask] LLM generation failed:', msg);
         console.error('[/ask] question:', JSON.stringify(question),
-          '| chunks:', chunks.length,
-          '| sources:', chunks.map(c => c.source_url).filter(Boolean).join(', ') || '(none)');
+          '| chunks:', result.chunks.length,
+          '| best source:', result.bestSource ?? '(none)');
         console.log('[/ask] answer source: LLM_FAILED — returning graceful error');
         content = LLM_FAILURE_MSG;
       }
