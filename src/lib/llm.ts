@@ -56,13 +56,28 @@ function buildUserMessage(question: string, chunks: Chunk[]): string {
 // ─── Answer cleaning ──────────────────────────────────────────────────────────
 
 function cleanAnswer(raw: string): string {
-  let t = raw;
-  // Strip <think>...</think> blocks Qwen3 may emit
+  let t = raw ?? '';
+
+  // Step 1: If the output contains </think>, discard everything before (and
+  // including) the LAST occurrence. This handles the case where Qwen3 emits a
+  // reasoning prefix that ends with </think> but the <think> opener was never
+  // sent — the whole prefix up to the final closer is reasoning noise.
+  const lastClose = t.lastIndexOf('</think>');
+  const strippedThinkPrefix = lastClose !== -1;
+  if (strippedThinkPrefix) {
+    t = t.slice(lastClose + '</think>'.length);
+  }
+  console.log('[LLM] stripped thinking prefix:', strippedThinkPrefix);
+
+  // Step 2: Remove any complete <think>...</think> blocks that remain
   t = t.replace(/<think>[\s\S]*?<\/think>/gi, '');
-  // Strip Markdown code fences
-  t = t.replace(/^```[\w]*\s*/i, '').replace(/\s*```\s*$/i, '');
-  // Strip leading "Answer:" prefix the model may add
+
+  // Step 3: Unwrap Markdown code fences (keep inner content)
+  t = t.replace(/```(?:\w+)?\s*([\s\S]*?)```/g, '$1');
+
+  // Step 4: Strip leading "Answer:" prefix the model may add
   t = t.replace(/^(?:final\s+)?answer\s*[:：]\s*/i, '');
+
   return t.trim();
 }
 
@@ -174,11 +189,11 @@ export async function generateAnswer(
   const answer = cleanAnswer(rawText);
   console.log('[LLM] cleaned answer length:', answer.length);
 
-  if (!answer) {
+  if (!answer.trim()) {
     throw new Error('[LLM] rejection reason: cleaned answer is empty after stripping');
   }
-  if (/<think>/i.test(answer)) {
-    throw new Error('[LLM] rejection reason: answer still contains <think> tag after stripping');
+  if (/<\/?think\b/i.test(answer)) {
+    throw new Error('[LLM] rejection reason: residual thinking tag after cleaning');
   }
   if (/^Reasoning\s*:/im.test(answer)) {
     throw new Error('[LLM] rejection reason: answer begins with "Reasoning:" bleed-through');
